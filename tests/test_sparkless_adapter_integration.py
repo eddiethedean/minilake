@@ -44,7 +44,11 @@ class SparklessFaultProxy:
         self.upstream_url = upstream_url.rstrip("/")
         self._lock = threading.Lock()
         self._drop_next: set[str] = set()
+        self._delay_next: dict[str, float] = {}
         self.dropped_operation_ids: list[str] = []
+        self.delayed_operation_ids: list[str] = []
+        self.status_operation_ids: list[str] = []
+        self.statement_operation_ids: list[str] = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,6 +61,23 @@ class SparklessFaultProxy:
             def _forward(self):
                 content_length = int(self.headers.get("Content-Length", "0"))
                 request_body = self.rfile.read(content_length)
+                operation_id = None
+                if self.path == "/statements":
+                    try:
+                        payload = json.loads(request_body)
+                        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+                    except (TypeError, ValueError):
+                        pass
+                    if operation_id:
+                        owner._record_statement(operation_id)
+                if self.path == "/operations/status":
+                    try:
+                        payload = json.loads(request_body)
+                        status_operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+                    except (TypeError, ValueError):
+                        status_operation_id = None
+                    if status_operation_id:
+                        owner._record_status(status_operation_id)
                 try:
                     upstream = requests.request(
                         self.command,
@@ -69,13 +90,6 @@ class SparklessFaultProxy:
                     self.send_error(502, str(exc))
                     return
 
-                operation_id = None
-                if self.path == "/statements":
-                    try:
-                        payload = json.loads(request_body)
-                        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
-                    except (TypeError, ValueError):
-                        pass
                 if operation_id and upstream.status_code == 200 and owner._should_drop(operation_id):
                     self.close_connection = True
                     try:
@@ -84,6 +98,9 @@ class SparklessFaultProxy:
                         pass
                     self.connection.close()
                     return
+                delay_seconds = owner._take_delay(operation_id) if operation_id else None
+                if delay_seconds is not None:
+                    time.sleep(delay_seconds)
 
                 self.send_response(upstream.status_code)
                 self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/json"))
@@ -108,6 +125,10 @@ class SparklessFaultProxy:
         with self._lock:
             self._drop_next.add(operation_id)
 
+    def delay_next_response(self, operation_id: str, delay_seconds: float) -> None:
+        with self._lock:
+            self._delay_next[operation_id] = delay_seconds
+
     def _should_drop(self, operation_id: str) -> bool:
         with self._lock:
             if operation_id not in self._drop_next:
@@ -115,6 +136,21 @@ class SparklessFaultProxy:
             self._drop_next.remove(operation_id)
             self.dropped_operation_ids.append(operation_id)
             return True
+
+    def _take_delay(self, operation_id: str) -> float | None:
+        with self._lock:
+            delay_seconds = self._delay_next.pop(operation_id, None)
+            if delay_seconds is not None:
+                self.delayed_operation_ids.append(operation_id)
+            return delay_seconds
+
+    def _record_status(self, operation_id: str) -> None:
+        with self._lock:
+            self.status_operation_ids.append(operation_id)
+
+    def _record_statement(self, operation_id: str) -> None:
+        with self._lock:
+            self.statement_operation_ids.append(operation_id)
 
     def close(self) -> None:
         self._server.shutdown()
@@ -192,6 +228,7 @@ def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, Non
         env = {
             **os.environ,
             "MINILAKE_SPARKLESS_SERVER_URL": fault_proxy.url,
+            "MINILAKE_SPARKLESS_REQUEST_TIMEOUT": "5",
             "MINILAKE_DATA_DIR": str(tmp_path_factory.mktemp("sparkless-minilake-data")),
             "MINILAKE_NOTEBOOK": "0",
             "MINILAKE_MCP": "0",
@@ -306,23 +343,29 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
     assert query.result.data_array == [[1]]
 
 
-def test_adapter_recovers_committed_write_after_real_response_disconnect(
+@pytest.mark.parametrize("failure_mode", ["disconnect", "deadline"])
+def test_adapter_recovers_committed_write_after_real_response_fault(
     workspace_client: WorkspaceClient,
     minilake_server: IntegrationServers,
+    failure_mode: str,
 ):
-    warehouse = workspace_client.warehouses.create(name="sparkless_response_disconnect")
+    warehouse = workspace_client.warehouses.create(name=f"sparkless_response_{failure_mode}")
+    table_name = f"response_fault_{failure_mode}"
     workspace_client.statement_execution.execute_statement(
         warehouse_id=warehouse.id,
-        statement="CREATE TABLE response_disconnect (id BIGINT)",
+        statement=f"CREATE TABLE {table_name} (id BIGINT)",
     )
-    operation_id = "sdk-response-disconnect-1"
-    minilake_server.drop_next_sparkless_response(operation_id)
+    operation_id = f"sdk-response-{failure_mode}-1"
+    if failure_mode == "disconnect":
+        minilake_server.drop_next_sparkless_response(operation_id)
+    else:
+        minilake_server.fault_proxy.delay_next_response(operation_id, 5.25)
 
     response = requests.post(
         f"{minilake_server.minilake_url}/api/2.0/sql/statements",
         json={
             "warehouse_id": warehouse.id,
-            "statement": "INSERT INTO response_disconnect VALUES (5)",
+            "statement": f"INSERT INTO {table_name} VALUES (5)",
             "sparkless_operation_id": operation_id,
         },
         timeout=30,
@@ -332,7 +375,12 @@ def test_adapter_recovers_committed_write_after_real_response_disconnect(
     body = response.json()
     assert body["operation_id"] == operation_id
     assert body["receipt"]
-    assert operation_id in minilake_server.fault_proxy.dropped_operation_ids
+    if failure_mode == "disconnect":
+        assert operation_id in minilake_server.fault_proxy.dropped_operation_ids
+    else:
+        assert operation_id in minilake_server.fault_proxy.delayed_operation_ids
+    assert operation_id in minilake_server.fault_proxy.status_operation_ids
+    assert minilake_server.fault_proxy.statement_operation_ids.count(operation_id) == 1
 
     outcome = requests.post(
         f"{minilake_server.sparkless_url}/operations/status",
@@ -344,7 +392,7 @@ def test_adapter_recovers_committed_write_after_real_response_disconnect(
 
     count = workspace_client.statement_execution.execute_statement(
         warehouse_id=warehouse.id,
-        statement="SELECT count(*) AS n FROM response_disconnect",
+        statement=f"SELECT count(*) AS n FROM {table_name}",
     )
     assert count.result.data_array == [[1]]
 
