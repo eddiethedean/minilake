@@ -5,13 +5,16 @@ tests/test_sparkless_adapter_integration.py -q``. This deliberately launches bot
 processes; the protocol unit tests in ``test_sparkless_adapter.py`` need no native binary.
 """
 
+import json
 import os
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Generator
 
@@ -32,6 +35,91 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class SparklessFaultProxy:
+    """Transparent local HTTP forwarder that can drop a committed response once."""
+
+    def __init__(self, upstream_url: str):
+        self.upstream_url = upstream_url.rstrip("/")
+        self._lock = threading.Lock()
+        self._drop_next: set[str] = set()
+        self.dropped_operation_ids: list[str] = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                self._forward()
+
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                self._forward()
+
+            def _forward(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                request_body = self.rfile.read(content_length)
+                try:
+                    upstream = requests.request(
+                        self.command,
+                        f"{owner.upstream_url}{self.path}",
+                        data=request_body,
+                        headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
+                        timeout=30,
+                    )
+                except requests.RequestException as exc:
+                    self.send_error(502, str(exc))
+                    return
+
+                operation_id = None
+                if self.path == "/statements":
+                    try:
+                        payload = json.loads(request_body)
+                        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+                    except (TypeError, ValueError):
+                        pass
+                if operation_id and upstream.status_code == 200 and owner._should_drop(operation_id):
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.connection.close()
+                    return
+
+                self.send_response(upstream.status_code)
+                self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(upstream.content)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(upstream.content)
+                except OSError:
+                    pass
+
+            def log_message(self, _format, *_args):
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def drop_next_response(self, operation_id: str) -> None:
+        with self._lock:
+            self._drop_next.add(operation_id)
+
+    def _should_drop(self, operation_id: str) -> bool:
+        with self._lock:
+            if operation_id not in self._drop_next:
+                return False
+            self._drop_next.remove(operation_id)
+            self.dropped_operation_ids.append(operation_id)
+            return True
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 def _wait_ready(url: str, process: subprocess.Popen, route: str) -> None:
@@ -55,7 +143,11 @@ class IntegrationServers:
     sparkless_url: str
     binary: Path
     sparkless_port: int
+    fault_proxy: SparklessFaultProxy
     sparkless_processes: list[subprocess.Popen] = field(default_factory=list)
+
+    def drop_next_sparkless_response(self, operation_id: str) -> None:
+        self.fault_proxy.drop_next_response(operation_id)
 
     def restart_sparkless(self) -> None:
         current = self.sparkless_processes[-1]
@@ -89,14 +181,17 @@ def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, Non
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    servers = IntegrationServers(minilake_url, sparkless_url, binary, server_port, [sparkless])
+    fault_proxy = None
+    servers = None
     minilake = None
     try:
         _wait_ready(sparkless_url, sparkless, "/capabilities")
+        fault_proxy = SparklessFaultProxy(sparkless_url)
+        servers = IntegrationServers(minilake_url, sparkless_url, binary, server_port, fault_proxy, [sparkless])
         project_root = Path(__file__).resolve().parents[1]
         env = {
             **os.environ,
-            "MINILAKE_SPARKLESS_SERVER_URL": sparkless_url,
+            "MINILAKE_SPARKLESS_SERVER_URL": fault_proxy.url,
             "MINILAKE_DATA_DIR": str(tmp_path_factory.mktemp("sparkless-minilake-data")),
             "MINILAKE_NOTEBOOK": "0",
             "MINILAKE_MCP": "0",
@@ -111,7 +206,8 @@ def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, Non
         _wait_ready(minilake_url, minilake, "/_minilake/health")
         yield servers
     finally:
-        for process in [minilake, *servers.sparkless_processes]:
+        processes = [minilake, *(servers.sparkless_processes if servers else [sparkless])]
+        for process in processes:
             if process is None:
                 continue
             process.terminate()
@@ -122,6 +218,8 @@ def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, Non
                 process.wait(timeout=5)
             if process.stderr:
                 process.stderr.close()
+        if fault_proxy:
+            fault_proxy.close()
 
 
 @pytest.fixture
@@ -206,6 +304,49 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
         statement="SELECT count(*) AS n FROM replay_table",
     )
     assert query.result.data_array == [[1]]
+
+
+def test_adapter_recovers_committed_write_after_real_response_disconnect(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_response_disconnect")
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="CREATE TABLE response_disconnect (id BIGINT)",
+    )
+    operation_id = "sdk-response-disconnect-1"
+    minilake_server.drop_next_sparkless_response(operation_id)
+
+    response = requests.post(
+        f"{minilake_server.minilake_url}/api/2.0/sql/statements",
+        json={
+            "warehouse_id": warehouse.id,
+            "statement": "INSERT INTO response_disconnect VALUES (5)",
+            "sparkless_operation_id": operation_id,
+        },
+        timeout=30,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["operation_id"] == operation_id
+    assert body["receipt"]
+    assert operation_id in minilake_server.fault_proxy.dropped_operation_ids
+
+    outcome = requests.post(
+        f"{minilake_server.sparkless_url}/operations/status",
+        json={"server_instance_id": body["server_instance_id"], "operation_id": operation_id},
+        timeout=10,
+    )
+    assert outcome.status_code == 200
+    assert outcome.json()["effect_outcome"] == "committed"
+
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT count(*) AS n FROM response_disconnect",
+    )
+    assert count.result.data_array == [[1]]
 
 
 def test_sdk_adapter_rejects_reused_identity_with_changed_sql_or_session(
