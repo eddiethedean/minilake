@@ -10,6 +10,7 @@ import socket
 import subprocess
 import time
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator
 
@@ -47,8 +48,33 @@ def _wait_ready(url: str, process: subprocess.Popen, route: str) -> None:
     raise RuntimeError(f"server at {url} did not become ready at {route}")
 
 
+@dataclass
+class IntegrationServers:
+    minilake_url: str
+    sparkless_url: str
+    binary: Path
+    sparkless_port: int
+    sparkless_processes: list[subprocess.Popen] = field(default_factory=list)
+
+    def restart_sparkless(self) -> None:
+        current = self.sparkless_processes[-1]
+        current.terminate()
+        try:
+            current.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            current.kill()
+            current.wait(timeout=5)
+        replacement = subprocess.Popen(
+            [str(self.binary), "serve", "--host", "127.0.0.1", "--port", str(self.sparkless_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.sparkless_processes.append(replacement)
+        _wait_ready(self.sparkless_url, replacement, "/capabilities")
+
+
 @pytest.fixture(scope="session")
-def minilake_server(tmp_path_factory) -> Generator[str, None, None]:
+def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, None]:
     """Override the regular fixture with an isolated native-Sparkless pair."""
     binary = Path(os.environ["SPARKLESS_SERVER_BIN"]).resolve()
     if not binary.is_file():
@@ -62,6 +88,7 @@ def minilake_server(tmp_path_factory) -> Generator[str, None, None]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    servers = IntegrationServers(minilake_url, sparkless_url, binary, server_port, [sparkless])
     minilake = None
     try:
         _wait_ready(sparkless_url, sparkless, "/capabilities")
@@ -81,9 +108,9 @@ def minilake_server(tmp_path_factory) -> Generator[str, None, None]:
             stderr=subprocess.PIPE,
         )
         _wait_ready(minilake_url, minilake, "/_minilake/health")
-        yield minilake_url
+        yield servers
     finally:
-        for process in (minilake, sparkless):
+        for process in [minilake, *servers.sparkless_processes]:
             if process is None:
                 continue
             process.terminate()
@@ -97,12 +124,12 @@ def minilake_server(tmp_path_factory) -> Generator[str, None, None]:
 
 
 @pytest.fixture
-def workspace_client(minilake_server: str) -> WorkspaceClient:
-    return WorkspaceClient(host=minilake_server, token="test-token", auth_type="pat")
+def workspace_client(minilake_server: IntegrationServers) -> WorkspaceClient:
+    return WorkspaceClient(host=minilake_server.minilake_url, token="test-token", auth_type="pat")
 
 
 def test_public_sdk_reads_typed_values_and_mutates_native_catalog(
-    workspace_client: WorkspaceClient, minilake_server: str
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
 ):
     warehouse = workspace_client.warehouses.create(name="sparkless_sdk")
     workspace_client.statement_execution.execute_statement(
@@ -139,7 +166,7 @@ def test_public_sdk_reads_typed_values_and_mutates_native_catalog(
     assert empty.manifest.schema.column_count == 1
     assert empty.manifest.schema.columns[0].type_text == "DECIMAL(12,3)"
     raw_empty = requests.post(
-        f"{minilake_server}/api/2.0/sql/statements",
+        f"{minilake_server.minilake_url}/api/2.0/sql/statements",
         json={
             "warehouse_id": warehouse.id,
             "statement": "SELECT CAST(NULL AS DECIMAL(12, 3)) AS amount WHERE false",
@@ -150,7 +177,7 @@ def test_public_sdk_reads_typed_values_and_mutates_native_catalog(
 
 
 def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
-    workspace_client: WorkspaceClient, minilake_server: str
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
 ):
     warehouse = workspace_client.warehouses.create(name="sparkless_replay")
     workspace_client.statement_execution.execute_statement(
@@ -158,7 +185,7 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
         statement="CREATE TABLE replay_table (id BIGINT)",
     )
     statement = "INSERT INTO replay_table VALUES (7)"
-    url = f"{minilake_server}/api/2.0/sql/statements"
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
     body = {
         "warehouse_id": warehouse.id,
         "statement": statement,
@@ -181,10 +208,10 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
 
 
 def test_custom_retry_is_bound_to_the_original_server_instance(
-    workspace_client: WorkspaceClient, minilake_server: str
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
 ):
     warehouse = workspace_client.warehouses.create(name="sparkless_instance_binding")
-    url = f"{minilake_server}/api/2.0/sql/statements"
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
     created = requests.post(
         url,
         json={"warehouse_id": warehouse.id, "statement": "CREATE TABLE instance_bound (id BIGINT)"},
@@ -225,6 +252,49 @@ def test_custom_retry_is_bound_to_the_original_server_instance(
     count = workspace_client.statement_execution.execute_statement(
         warehouse_id=warehouse.id,
         statement="SELECT count(*) AS n FROM instance_bound",
+    )
+    assert count.result.data_array == [[1]]
+
+
+def test_restart_rejects_a_retry_bound_to_the_previous_instance(
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_restart_retry")
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
+    capabilities_url = f"{minilake_server.sparkless_url}/capabilities"
+    old_instance = requests.get(capabilities_url, timeout=10).json()["server_instance_id"]
+    create = requests.post(
+        url,
+        json={"warehouse_id": warehouse.id, "statement": "CREATE TABLE restart_retry (id BIGINT)"},
+        timeout=30,
+    )
+    assert create.status_code == 200
+    request_body = {
+        "warehouse_id": warehouse.id,
+        "statement": "INSERT INTO restart_retry VALUES (1)",
+        "sparkless_operation_id": "sdk-restart-bound-1",
+        "sparkless_server_instance_id": old_instance,
+    }
+    first = requests.post(url, json=request_body, timeout=30)
+    assert first.status_code == 200
+
+    minilake_server.restart_sparkless()
+    new_instance = requests.get(capabilities_url, timeout=10).json()["server_instance_id"]
+    assert new_instance != old_instance
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="CREATE TABLE restart_retry (id BIGINT)",
+    )
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="INSERT INTO restart_retry VALUES (2)",
+    )
+
+    stale_retry = requests.post(url, json=request_body, timeout=30)
+    assert stale_retry.status_code == 409
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT count(*) AS n FROM restart_retry",
     )
     assert count.result.data_array == [[1]]
 
