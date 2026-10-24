@@ -172,6 +172,32 @@ async def test_instance_change_during_ambiguous_write_is_never_retried(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_expected_server_instance_mismatch_rejects_write_before_submission(monkeypatch):
+    monkeypatch.setattr(adapter.settings, "sparkless_server_url", "http://sparkless.test")
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path == "/capabilities":
+            return httpx.Response(200, json=_capabilities(instance="instance-2"))
+        pytest.fail("a stale-instance mutation must not reach /statements")
+
+    client = _install_transport(monkeypatch, handler)
+    try:
+        with pytest.raises(DatabricksError, match="instance changed"):
+            await adapter.execute_statement(
+                "warehouse-1",
+                "INSERT INTO t VALUES (1)",
+                supplied_operation_id="stable-write-1",
+                supplied_server_instance_id="instance-1",
+            )
+    finally:
+        await client.aclose()
+
+    assert paths == ["/capabilities"]
+
+
+@pytest.mark.asyncio
 async def test_incompatible_protocol_fails_before_statement_submission(monkeypatch):
     monkeypatch.setattr(adapter.settings, "sparkless_server_url", "http://sparkless.test")
     paths = []

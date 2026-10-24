@@ -251,6 +251,7 @@ async def execute_statement(
     *,
     request_headers: Optional[dict[str, str]] = None,
     supplied_operation_id: Optional[str] = None,
+    supplied_server_instance_id: Optional[str] = None,
     catalog: Optional[str] = None,
     schema_name: Optional[str] = None,
     has_parameters: bool = False,
@@ -274,12 +275,28 @@ async def execute_statement(
     operation_id = supplied_operation_id or headers.get("x-sparkless-operation-id") or uuid.uuid4().hex
     if not _SAFE_ID.fullmatch(operation_id):
         raise DatabricksError("INVALID_REQUEST", "Sparkless operation ID must be 1-128 safe ASCII bytes", 400)
+    header_instance_id = headers.get("x-sparkless-server-instance-id")
+    if supplied_server_instance_id and header_instance_id and supplied_server_instance_id != header_instance_id:
+        raise DatabricksError(
+            "INVALID_REQUEST", "Sparkless server instance ID fields do not match", 400
+        )
+    expected_instance_id = supplied_server_instance_id or header_instance_id
+    if expected_instance_id and not _SAFE_ID.fullmatch(expected_instance_id):
+        raise DatabricksError(
+            "INVALID_REQUEST", "Sparkless server instance ID must be 1-128 safe ASCII bytes", 400
+        )
 
     base_url = _base_url()
     try:
         timeout = httpx.Timeout(settings.sparkless_request_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout) as client:
             instance_id, _ = await _capabilities(client, base_url)
+            if expected_instance_id and expected_instance_id != instance_id:
+                raise DatabricksError(
+                    "SERVER_INSTANCE_MISMATCH",
+                    "Sparkless server instance changed; the operation was not submitted",
+                    409,
+                )
             body = {
                 "session": warehouse_id,
                 "kind": "sql",

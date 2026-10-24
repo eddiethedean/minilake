@@ -1089,6 +1089,7 @@ async def execute_statement(req: ExecuteStatementRequest, request: Request) -> E
                 req.statement,
                 request_headers=dict(request.headers),
                 supplied_operation_id=req.sparkless_operation_id,
+                supplied_server_instance_id=req.sparkless_server_instance_id,
                 catalog=req.catalog,
                 schema_name=req.schema_name,
                 has_parameters=req.parameters is not None,

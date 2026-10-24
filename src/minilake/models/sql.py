@@ -106,9 +106,12 @@ class ExecuteStatementRequest(BaseModel):
     disposition: Optional[str] = "INLINE"  # INLINE or EXTERNAL_LINKS
     format: Optional[str] = "JSON_ARRAY"  # JSON_ARRAY, ARROW, CSV
     parameters: Optional[List[Dict[str, Any]]] = None
-    # Optional MiniLake extension for callers that need to reuse one Sparkless
-    # mutation identity across retries. The Databricks SDK does not send this field.
+    # Optional MiniLake extensions for callers that need to reuse one Sparkless
+    # mutation identity across requests. Supplying both values binds the retry to
+    # the server instance returned by the first response. The Databricks SDK does
+    # not send these fields.
     sparkless_operation_id: Optional[str] = None
+    sparkless_server_instance_id: Optional[str] = None
 
 
 class StatementState(str, Enum):

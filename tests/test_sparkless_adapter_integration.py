@@ -180,6 +180,55 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
     assert query.result.data_array == [[1]]
 
 
+def test_custom_retry_is_bound_to_the_original_server_instance(
+    workspace_client: WorkspaceClient, minilake_server: str
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_instance_binding")
+    url = f"{minilake_server}/api/2.0/sql/statements"
+    created = requests.post(
+        url,
+        json={"warehouse_id": warehouse.id, "statement": "CREATE TABLE instance_bound (id BIGINT)"},
+        timeout=30,
+    )
+    assert created.status_code == 200
+    instance_id = created.json()["server_instance_id"]
+
+    statement = "INSERT INTO instance_bound VALUES (9)"
+    request_body = {
+        "warehouse_id": warehouse.id,
+        "statement": statement,
+        "sparkless_operation_id": "sdk-instance-bound-1",
+        "sparkless_server_instance_id": instance_id,
+    }
+    first = requests.post(url, json=request_body, timeout=30)
+    retry = requests.post(url, json=request_body, timeout=30)
+    assert first.status_code == retry.status_code == 200
+    first_body = first.json()
+    retry_body = retry.json()
+    assert first_body["server_instance_id"] == instance_id
+    assert retry_body["server_instance_id"] == instance_id
+    assert first_body["operation_id"] == retry_body["operation_id"] == "sdk-instance-bound-1"
+    assert first_body["receipt"] == retry_body["receipt"]
+
+    stale_retry = requests.post(
+        url,
+        json={
+            **request_body,
+            "statement": "INSERT INTO instance_bound VALUES (10)",
+            "sparkless_operation_id": "sdk-stale-instance-1",
+            "sparkless_server_instance_id": "previous-instance",
+        },
+        timeout=30,
+    )
+    assert stale_retry.status_code == 409
+
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT count(*) AS n FROM instance_bound",
+    )
+    assert count.result.data_array == [[1]]
+
+
 def test_native_decimal_schema_is_preserved_in_arrow_external_link(workspace_client: WorkspaceClient):
     import pyarrow as pa
 
