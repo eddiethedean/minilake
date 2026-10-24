@@ -10,6 +10,7 @@ import socket
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator
@@ -205,6 +206,84 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
         statement="SELECT count(*) AS n FROM replay_table",
     )
     assert query.result.data_array == [[1]]
+
+
+def test_sdk_adapter_rejects_reused_identity_with_changed_sql_or_session(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    first_warehouse = workspace_client.warehouses.create(name="sparkless_identity_original")
+    other_warehouse = workspace_client.warehouses.create(name="sparkless_identity_other")
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
+    create = requests.post(
+        url,
+        json={
+            "warehouse_id": first_warehouse.id,
+            "statement": "CREATE TABLE identity_conflict (id BIGINT)",
+        },
+        timeout=30,
+    )
+    assert create.status_code == 200
+
+    identity = "sdk-identity-conflict-1"
+    original = {
+        "warehouse_id": first_warehouse.id,
+        "statement": "INSERT INTO identity_conflict VALUES (1)",
+        "sparkless_operation_id": identity,
+    }
+    accepted = requests.post(url, json=original, timeout=30)
+    assert accepted.status_code == 200
+
+    changed_sql = requests.post(
+        url,
+        json={**original, "statement": "INSERT INTO identity_conflict VALUES (2)"},
+        timeout=30,
+    )
+    assert changed_sql.status_code == 409
+
+    changed_session = requests.post(
+        url,
+        json={**original, "warehouse_id": other_warehouse.id},
+        timeout=30,
+    )
+    assert changed_session.status_code == 409
+
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=first_warehouse.id,
+        statement="SELECT count(*) AS n FROM identity_conflict",
+    )
+    assert count.result.data_array == [[1]]
+
+
+def test_concurrent_public_sdk_replays_share_one_mutation_receipt(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_concurrent_replay")
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="CREATE TABLE concurrent_replay (id BIGINT)",
+    )
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
+    body = {
+        "warehouse_id": warehouse.id,
+        "statement": "INSERT INTO concurrent_replay VALUES (42)",
+        "sparkless_operation_id": "sdk-concurrent-replay-1",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(lambda _: requests.post(url, json=body, timeout=30), range(2)))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    first_body, second_body = [response.json() for response in responses]
+    assert first_body["operation_id"] == second_body["operation_id"] == body["sparkless_operation_id"]
+    assert first_body["receipt"] == second_body["receipt"]
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT count(*) AS n FROM concurrent_replay",
+    )
+    assert result.result.data_array == [[1]]
 
 
 def test_custom_retry_is_bound_to_the_original_server_instance(
