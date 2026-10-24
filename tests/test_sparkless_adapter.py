@@ -145,6 +145,89 @@ async def test_committed_status_recovers_lost_write_response_without_replay(monk
 
 
 @pytest.mark.asyncio
+async def test_deadline_with_pending_status_returns_pending_without_replay(monkeypatch):
+    monkeypatch.setattr(adapter.settings, "sparkless_server_url", "http://sparkless.test")
+    monkeypatch.setattr(adapter.settings, "sparkless_status_poll_interval_seconds", 0)
+    posted = []
+    operation = {
+        "server_instance_id": "instance-1",
+        "operation_id": "deadline-pending-1",
+        "execution_state": "running",
+        "effect_outcome": "pending",
+        "receipt": None,
+        "error": None,
+    }
+
+    def handler(request):
+        if request.url.path == "/capabilities":
+            return httpx.Response(200, json=_capabilities())
+        if request.url.path == "/statements":
+            posted.append(request.read())
+            return httpx.Response(
+                504,
+                json={
+                    "status": "error",
+                    "ename": "DeadlineExceeded",
+                    "evalue": "operation is still running",
+                    "operation": operation,
+                },
+            )
+        return httpx.Response(200, json=operation)
+
+    client = _install_transport(monkeypatch, handler)
+    try:
+        result = await adapter.execute_statement(
+            "warehouse-1", "INSERT INTO t VALUES (1)", supplied_operation_id=operation["operation_id"]
+        )
+    finally:
+        await client.aclose()
+
+    assert len(posted) == 1
+    assert result.pending is True
+    assert result.operation == operation
+    assert result.operation_id == operation["operation_id"]
+
+
+@pytest.mark.asyncio
+async def test_deadline_recovers_committed_receipt_without_replay(monkeypatch):
+    monkeypatch.setattr(adapter.settings, "sparkless_server_url", "http://sparkless.test")
+    monkeypatch.setattr(adapter.settings, "sparkless_status_poll_interval_seconds", 0)
+    posted = []
+    operation = {
+        "server_instance_id": "instance-1",
+        "operation_id": "deadline-committed-1",
+        "execution_state": "succeeded",
+        "effect_outcome": "committed",
+        "receipt": {"kind": "table", "name": "default.t", "version": 3},
+        "error": None,
+    }
+
+    def handler(request):
+        if request.url.path == "/capabilities":
+            return httpx.Response(200, json=_capabilities())
+        if request.url.path == "/statements":
+            posted.append(request.read())
+            return httpx.Response(
+                504,
+                json={"status": "error", "ename": "DeadlineExceeded", "operation": operation},
+            )
+        return httpx.Response(200, json=operation)
+
+    client = _install_transport(monkeypatch, handler)
+    try:
+        result = await adapter.execute_statement(
+            "warehouse-1", "INSERT INTO t VALUES (1)", supplied_operation_id=operation["operation_id"]
+        )
+    finally:
+        await client.aclose()
+
+    assert len(posted) == 1
+    assert result.pending is False
+    assert result.operation == operation
+    assert result.receipt == operation["receipt"]
+
+
+@pytest.mark.asyncio
 async def test_instance_change_during_ambiguous_write_is_never_retried(monkeypatch):
     monkeypatch.setattr(adapter.settings, "sparkless_server_url", "http://sparkless.test")
     monkeypatch.setattr(adapter.settings, "sparkless_status_poll_interval_seconds", 0)
