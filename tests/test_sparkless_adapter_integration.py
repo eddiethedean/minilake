@@ -45,10 +45,13 @@ class SparklessFaultProxy:
         self._lock = threading.Lock()
         self._drop_next: set[str] = set()
         self._delay_next: dict[str, float] = {}
+        self._delay_next_request: dict[str, list[float]] = {}
         self.dropped_operation_ids: list[str] = []
         self.delayed_operation_ids: list[str] = []
+        self.delayed_request_operation_ids: list[str] = []
         self.status_operation_ids: list[str] = []
         self.statement_operation_ids: list[str] = []
+        self.forwarded_statement_operation_ids: list[str] = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -70,6 +73,9 @@ class SparklessFaultProxy:
                         pass
                     if operation_id:
                         owner._record_statement(operation_id)
+                        request_delay = owner._take_request_delay(operation_id)
+                        if request_delay is not None:
+                            time.sleep(request_delay)
                 if self.path == "/operations/status":
                     try:
                         payload = json.loads(request_body)
@@ -78,6 +84,8 @@ class SparklessFaultProxy:
                         status_operation_id = None
                     if status_operation_id:
                         owner._record_status(status_operation_id)
+                if operation_id:
+                    owner._record_forwarded_statement(operation_id)
                 try:
                     upstream = requests.request(
                         self.command,
@@ -129,6 +137,22 @@ class SparklessFaultProxy:
         with self._lock:
             self._delay_next[operation_id] = delay_seconds
 
+    def delay_next_request(self, operation_id: str, delay_seconds: float) -> None:
+        """Hold one mutation before forwarding it to the native service."""
+        with self._lock:
+            self._delay_next_request.setdefault(operation_id, []).append(delay_seconds)
+
+    def _take_request_delay(self, operation_id: str) -> float | None:
+        with self._lock:
+            delays = self._delay_next_request.get(operation_id)
+            if not delays:
+                return None
+            delay_seconds = delays.pop(0)
+            if not delays:
+                del self._delay_next_request[operation_id]
+            self.delayed_request_operation_ids.append(operation_id)
+            return delay_seconds
+
     def _should_drop(self, operation_id: str) -> bool:
         with self._lock:
             if operation_id not in self._drop_next:
@@ -151,6 +175,10 @@ class SparklessFaultProxy:
     def _record_statement(self, operation_id: str) -> None:
         with self._lock:
             self.statement_operation_ids.append(operation_id)
+
+    def _record_forwarded_statement(self, operation_id: str) -> None:
+        with self._lock:
+            self.forwarded_statement_operation_ids.append(operation_id)
 
     def close(self) -> None:
         self._server.shutdown()
@@ -381,6 +409,64 @@ def test_adapter_recovers_committed_write_after_real_response_fault(
         assert operation_id in minilake_server.fault_proxy.delayed_operation_ids
     assert operation_id in minilake_server.fault_proxy.status_operation_ids
     assert minilake_server.fault_proxy.statement_operation_ids.count(operation_id) == 1
+
+    outcome = requests.post(
+        f"{minilake_server.sparkless_url}/operations/status",
+        json={"server_instance_id": body["server_instance_id"], "operation_id": operation_id},
+        timeout=10,
+    )
+    assert outcome.status_code == 200
+    assert outcome.json()["effect_outcome"] == "committed"
+
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"SELECT count(*) AS n FROM {table_name}",
+    )
+    assert count.result.data_array == [[1]]
+
+
+def test_adapter_returns_pending_when_request_deadline_precedes_acceptance(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_pending_before_acceptance")
+    table_name = "pending_before_acceptance"
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {table_name} (id BIGINT)",
+    )
+    operation_id = "sdk-pending-before-acceptance-1"
+
+    # The adapter makes two same-identity attempts, each with a five-second deadline.
+    # Hold both before forwarding so operation-status lookups can prove that neither
+    # attempt was accepted when the adapter returns a pending outcome.
+    minilake_server.fault_proxy.delay_next_request(operation_id, 12.0)
+    minilake_server.fault_proxy.delay_next_request(operation_id, 6.0)
+    response = requests.post(
+        f"{minilake_server.minilake_url}/api/2.0/sql/statements",
+        json={
+            "warehouse_id": warehouse.id,
+            "statement": f"INSERT INTO {table_name} VALUES (9)",
+            "sparkless_operation_id": operation_id,
+        },
+        timeout=20,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"]["state"] == "RUNNING"
+    assert body["operation_id"] == operation_id
+    assert body["effect_outcome"] == "pending"
+    assert body.get("receipt") is None
+    assert minilake_server.fault_proxy.statement_operation_ids.count(operation_id) == 2
+    assert minilake_server.fault_proxy.forwarded_statement_operation_ids.count(operation_id) == 0
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if minilake_server.fault_proxy.forwarded_statement_operation_ids.count(operation_id) == 2:
+            break
+        time.sleep(0.05)
+    assert minilake_server.fault_proxy.forwarded_statement_operation_ids.count(operation_id) == 2
 
     outcome = requests.post(
         f"{minilake_server.sparkless_url}/operations/status",
