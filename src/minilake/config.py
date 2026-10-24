@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # one, every result set a long-lived server ever produced stays resident.
     statement_cache_size: int = int(os.getenv("MINILAKE_STATEMENT_CACHE_SIZE", "500"))
 
+    # Optional native SQL backend. When unset, Statement Execution uses DuckDB as it
+    # always has. Sparkless speaks a separate, versioned HTTP contract and is negotiated
+    # on every statement before any SQL is forwarded.
+    sparkless_server_url: Optional[str] = os.getenv("MINILAKE_SPARKLESS_SERVER_URL")
+    sparkless_request_timeout_seconds: float = float(os.getenv("MINILAKE_SPARKLESS_REQUEST_TIMEOUT", "35"))
+    sparkless_post_attempts: int = int(os.getenv("MINILAKE_SPARKLESS_POST_ATTEMPTS", "2"))
+    sparkless_status_polls: int = int(os.getenv("MINILAKE_SPARKLESS_STATUS_POLLS", "4"))
+    sparkless_status_poll_interval_seconds: float = float(os.getenv("MINILAKE_SPARKLESS_STATUS_POLL_INTERVAL", "0.1"))
+
     # Relax same-origin for the embedded UI's dev server (`pnpm dev` on :3000). Off by
     # default: the packaged UI is served from this same origin at /ui and needs no CORS,
     # and minilake has no auth to fall back on.

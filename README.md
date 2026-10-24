@@ -86,7 +86,7 @@ More in [Getting Started](https://github.com/dmux/minilake/blob/main/docs/gettin
 | **Unity Catalog** (catalogs, schemas, tables, volumes, functions) | ✅ Real | Each catalog = its own DuckDB database (`ATTACH`), native `catalog.schema.table` addressing; a SQL function becomes a real DuckDB macro, callable by its three-part name |
 | **Unity Catalog metastore** | ✅ Real | One synthetic metastore: `current-metastore-assignment`, `metastore_summary`, list/get |
 | **EXTERNAL Delta Tables** | ✅ Real | Real Delta files; `INSERT`/`UPDATE`/`DELETE` via a generated Spark job, reads via `delta_scan()` |
-| **SQL Statement Execution** | ✅ Real | Real DuckDB; `JSON_ARRAY`/`ARROW_STREAM`/`CSV`, `INLINE`/`EXTERNAL_LINKS`; result manifest carries column types |
+| **SQL Statement Execution** | ✅ Real | Real DuckDB by default; optional native Sparkless HTTP backend via `MINILAKE_SPARKLESS_SERVER_URL`; typed scalar schema and mutation receipts |
 | **SQL Warehouses** | ✅ Real | Full CRUD + lifecycle |
 | **Query History** | ✅ Real | `w.query_history.list()` over everything executed, failures included |
 | **Saved Queries** | ✅ Real | `w.queries.*` CRUD with `update_mask` |
@@ -109,6 +109,24 @@ More in [Getting Started](https://github.com/dmux/minilake/blob/main/docs/gettin
 | **JupyterLab + PySpark + Delta** (optional) | ✅ Real | `docker compose --profile notebook up` |
 | **MCP Server** (optional, `MINILAKE_MCP=1`) | ✅ Real | 67 tools + resources + prompts at `/mcp` — see [MCP Server](https://github.com/dmux/minilake/blob/main/docs/mcp/index.md) |
 | Repos, multi-language notebooks, DBT/pipeline tasks, DLT, Model Registry, Vector Search, Lakeview/Genie, Delta Sharing | 🚫 Not implemented | Returns `501 NOT_IMPLEMENTED`. For the measured picture, see [API coverage](https://github.com/dmux/minilake/blob/main/docs/CLI_COVERAGE.md) |
+
+### Native Sparkless SQL backend
+
+For native Sparkless Server development, MiniLake can route SQL Statement Execution to a
+separate Sparkless HTTP process while keeping DuckDB as the default for every other
+installation. Set `MINILAKE_SPARKLESS_SERVER_URL=http://127.0.0.1:8099` before starting
+MiniLake. The adapter negotiates `/capabilities`, preserves positional scalar values and
+the SQL result schema, and sends a stable operation identity on every outbound attempt.
+If a write response is ambiguous, it checks `/operations/status` and never resubmits the
+same operation under a new Sparkless instance identity.
+
+The public Databricks SDK can use the ordinary Statement Execution API for supported SQL.
+For caller-controlled replay across repeated API requests, send the MiniLake extension
+`sparkless_operation_id` in the request body or `X-Sparkless-Operation-Id` header. The
+SDK does not currently expose this extension. Catalog/schema defaults, SQL parameters,
+query tags, row/byte limits, and asynchronous wait options are rejected explicitly on
+this backend rather than silently ignored. Sparkless's own SQL allowlist and scalar-type
+matrix remain authoritative.
 
 ## Known Gaps
 

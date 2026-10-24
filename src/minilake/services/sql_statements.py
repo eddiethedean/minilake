@@ -820,7 +820,12 @@ async def _execute_sql_real_typed(
             _restore_default_namespace(conn, previous)
 
 
-def _serialize_chunk(columns: List[str], rows: List[List[Any]], fmt: str) -> tuple[bytes, str]:
+def _serialize_chunk(
+    columns: List[str],
+    rows: List[List[Any]],
+    fmt: str,
+    column_types: Optional[List[Optional[str]]] = None,
+) -> tuple[bytes, str]:
     """Serialize one chunk's rows to the requested wire format. Returns (bytes, content_type)."""
     if fmt == "CSV":
         buf = io.StringIO()
@@ -830,10 +835,54 @@ def _serialize_chunk(columns: List[str], rows: List[List[Any]], fmt: str) -> tup
         return buf.getvalue().encode("utf-8"), "text/csv"
 
     if fmt == "ARROW_STREAM":
+        from datetime import date, datetime, timezone
+        from decimal import Decimal
+
         import pyarrow as pa
 
-        arrays = [[row[i] for row in rows] for i in range(len(columns))] if rows else [[] for _ in columns]
-        table = pa.table({col: arrays[i] for i, col in enumerate(columns)})
+        types = column_types or []
+        arrays = []
+        for i, _column in enumerate(columns):
+            type_text = types[i] if i < len(types) else None
+            normalized = (type_text or "").strip().upper()
+            decimal = re.fullmatch(r"DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", normalized)
+            arrow_type = (
+                pa.decimal128(int(decimal.group(1)), int(decimal.group(2)))
+                if decimal
+                else {
+                    "STRING": pa.string(),
+                    "VARCHAR": pa.string(),
+                    "INT": pa.int32(),
+                    "INTEGER": pa.int32(),
+                    "SMALLINT": pa.int16(),
+                    "SHORT": pa.int16(),
+                    "BIGINT": pa.int64(),
+                    "LONG": pa.int64(),
+                    "BOOLEAN": pa.bool_(),
+                    "DOUBLE": pa.float64(),
+                    "FLOAT": pa.float32(),
+                    "DATE": pa.date32(),
+                    "TIMESTAMP": pa.timestamp("us", tz="UTC"),
+                }.get(normalized)
+            )
+            values = [row[i] for row in rows]
+            if decimal:
+                values = [Decimal(str(value)) if value is not None else None for value in values]
+            elif normalized == "DATE":
+                values = [date.fromisoformat(value) if isinstance(value, str) else value for value in values]
+            elif normalized == "TIMESTAMP":
+
+                def parse_timestamp(value):
+                    if value is None or isinstance(value, datetime):
+                        return value
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.astimezone(timezone.utc)
+
+                values = [parse_timestamp(value) for value in values]
+            arrays.append(pa.array(values, type=arrow_type) if arrow_type is not None else pa.array(values))
+        table = pa.Table.from_arrays(arrays, names=columns)
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, table.schema) as writer:
             writer.write_table(table)
@@ -843,16 +892,65 @@ def _serialize_chunk(columns: List[str], rows: List[List[Any]], fmt: str) -> tup
     return json.dumps(rows).encode("utf-8"), "application/json"
 
 
-def _column_infos(columns: List[str], column_types: Optional[List[Optional[str]]] = None) -> List[ColumnInfo]:
+def _column_infos(
+    columns: List[str],
+    column_types: Optional[List[Optional[str]]] = None,
+    column_nullability: Optional[List[Optional[bool]]] = None,
+) -> List[ColumnInfo]:
     """Build the `ColumnInfo` list for a result set, tolerating a missing type list
     (statements restored from an older snapshot, and the DDL paths that return no
     columns at all)."""
     types = column_types or []
+    nullability = column_nullability or []
+
+    def decimal_parts(type_text: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+        if type_text is None:
+            return None, None
+        match = re.fullmatch(r"DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", type_text, re.IGNORECASE)
+        return (int(match.group(1)), int(match.group(2))) if match else (None, None)
+
+    def sdk_type_name(type_text: Optional[str]) -> Optional[str]:
+        if type_text is None:
+            return None
+        normalized = type_text.strip().upper()
+        if re.fullmatch(r"DECIMAL\s*\(.*\)", normalized):
+            return "DECIMAL"
+        if normalized.startswith("ARRAY"):
+            return "ARRAY"
+        if normalized.startswith("MAP"):
+            return "MAP"
+        if normalized.startswith("STRUCT"):
+            return "STRUCT"
+        return {
+            "BIGINT": "LONG",
+            "LONG": "LONG",
+            "INT": "INT",
+            "INTEGER": "INT",
+            "SMALLINT": "SHORT",
+            "SHORT": "SHORT",
+            "TINYINT": "BYTE",
+            "BYTE": "BYTE",
+            "VARCHAR": "STRING",
+            "CHARACTER VARYING": "STRING",
+            "TEXT": "STRING",
+            "STRING": "STRING",
+            "BOOL": "BOOLEAN",
+            "BOOLEAN": "BOOLEAN",
+            "REAL": "FLOAT",
+            "FLOAT": "FLOAT",
+            "DOUBLE": "DOUBLE",
+            "DATE": "DATE",
+            "TIMESTAMP": "TIMESTAMP",
+        }.get(normalized, normalized if normalized in {"BINARY", "NULL", "INTERVAL"} else None)
+
     return [
         ColumnInfo(
             name=name,
             type_text=types[i] if i < len(types) else None,
-            type_name=types[i] if i < len(types) else None,
+            type_name=sdk_type_name(types[i] if i < len(types) else None),
+            type_precision=decimal_parts(types[i] if i < len(types) else None)[0],
+            type_scale=decimal_parts(types[i] if i < len(types) else None)[1],
+            nullable=nullability[i] if i < len(nullability) else None,
             position=i,
         )
         for i, name in enumerate(columns)
@@ -864,10 +962,11 @@ def _build_manifest(
     rows: List[List[Any]],
     fmt: str,
     column_types: Optional[List[Optional[str]]] = None,
+    column_nullability: Optional[List[Optional[bool]]] = None,
 ) -> ResultManifest:
     """Describe a result set's schema and chunking, the way the real API does."""
     chunks = [rows[i : i + _CHUNK_SIZE] for i in range(0, len(rows), _CHUNK_SIZE)] or [[]]
-    infos = _column_infos(columns, column_types)
+    infos = _column_infos(columns, column_types, column_nullability)
     return ResultManifest(
         format=fmt,
         schema=ResultSchema(column_count=len(infos), columns=infos),
@@ -888,6 +987,7 @@ def _build_result_data(
     disposition: str,
     fmt: str,
     column_types: Optional[List[Optional[str]]] = None,
+    column_nullability: Optional[List[Optional[bool]]] = None,
 ) -> ResultData:
     """Build the ResultData for a statement's first chunk, real INLINE data or
     real self-hosted EXTERNAL_LINKS depending on `disposition`."""
@@ -895,7 +995,7 @@ def _build_result_data(
         chunks = [rows[i : i + _CHUNK_SIZE] for i in range(0, len(rows), _CHUNK_SIZE)] or [[]]
         num_chunks = len(chunks)
         chunk_rows = chunks[0]
-        content, _ = _serialize_chunk(columns, chunk_rows, fmt)
+        content, _ = _serialize_chunk(columns, chunk_rows, fmt, column_types)
         base = str(request.base_url).rstrip("/")
         link = ExternalLink(
             chunk_index=0,
@@ -909,14 +1009,14 @@ def _build_result_data(
             ),
         )
         return ResultData(
-            columns=_column_infos(columns, column_types),
+            columns=_column_infos(columns, column_types, column_nullability),
             external_links=[link],
             row_count=len(rows),
             truncated=False,
         )
 
     return ResultData(
-        columns=_column_infos(columns, column_types),
+        columns=_column_infos(columns, column_types, column_nullability),
         data_array=rows,
         row_count=len(rows),
         truncated=False,
@@ -964,6 +1064,136 @@ async def execute_statement(req: ExecuteStatementRequest, request: Request) -> E
     statement_id = str(uuid.uuid4())
 
     now_ms = int(time.time() * 1000)
+
+    from minilake.services import sparkless_adapter
+
+    if sparkless_adapter.configured():
+        # Do not silently claim support for Statement API features that the native
+        # protocol does not carry. Inline/external-link rendering is handled locally
+        # after the typed native payload has been validated.
+        unsupported = {
+            key: value
+            for key, value in (req.model_extra or {}).items()
+            if key in {"byte_limit", "on_wait_timeout", "query_tags", "row_limit", "wait_timeout"} and value is not None
+        }
+        if unsupported:
+            raise DatabricksError(
+                error_code="NOT_IMPLEMENTED",
+                message=f"Sparkless backend does not support Statement API options: {', '.join(sorted(unsupported))}",
+                status_code=501,
+            )
+
+        try:
+            native = await sparkless_adapter.execute_statement(
+                req.warehouse_id,
+                req.statement,
+                request_headers=dict(request.headers),
+                supplied_operation_id=req.sparkless_operation_id,
+                catalog=req.catalog,
+                schema_name=req.schema_name,
+                has_parameters=req.parameters is not None,
+            )
+            if native.pending:
+                operation = native.operation or {}
+                operation_id = operation.get("operation_id") or native.operation_id
+                instance_id = operation.get("server_instance_id") or native.server_instance_id
+                _record_statement(
+                    {
+                        "id": statement_id,
+                        "sql": req.statement,
+                        "warehouse_id": req.warehouse_id,
+                        "status": StatementState.RUNNING.value,
+                        "result": None,
+                        "raw_columns": [],
+                        "raw_column_types": [],
+                        "raw_column_nullability": [],
+                        "raw_rows": [],
+                        "row_count": 0,
+                        "disposition": disposition,
+                        "format": fmt,
+                        "created_at": now_ms,
+                        "started_at": now_ms,
+                        "ended_at": None,
+                        "sparkless": {"server_instance_id": instance_id, "operation_id": operation_id},
+                        "sparkless_operation": operation,
+                        "effect_outcome": operation.get("effect_outcome", "pending"),
+                        "receipt": operation.get("receipt"),
+                    }
+                )
+                return ExecuteStatementResponse(
+                    statement_id=statement_id,
+                    status=StatementStatus(state=StatementState.RUNNING),
+                    message="Sparkless operation is still running; poll this statement for its final outcome",
+                    created_at=now_ms,
+                    started_at=now_ms,
+                    server_instance_id=instance_id,
+                    operation_id=operation_id,
+                    effect_outcome=operation.get("effect_outcome", "pending"),
+                    receipt=operation.get("receipt"),
+                )
+
+            result_data = _build_result_data(
+                request,
+                statement_id,
+                native.columns,
+                native.rows,
+                disposition,
+                fmt,
+                native.column_types,
+                native.nullable,
+            )
+            manifest = _build_manifest(
+                native.columns,
+                native.rows,
+                fmt,
+                native.column_types,
+                native.nullable,
+            )
+            operation = native.operation or {}
+            _record_statement(
+                {
+                    "id": statement_id,
+                    "sql": req.statement,
+                    "warehouse_id": req.warehouse_id,
+                    "status": StatementState.SUCCEEDED.value,
+                    "result": result_data.model_dump(),
+                    "manifest": manifest.model_dump(by_alias=True),
+                    "raw_columns": native.columns,
+                    "raw_column_types": native.column_types,
+                    "raw_column_nullability": native.nullable,
+                    "raw_rows": native.rows,
+                    "row_count": len(native.rows),
+                    "disposition": disposition,
+                    "format": fmt,
+                    "created_at": now_ms,
+                    "started_at": now_ms,
+                    "ended_at": int(time.time() * 1000),
+                    "sparkless": (
+                        {"server_instance_id": native.server_instance_id, "operation_id": native.operation_id}
+                        if operation
+                        else None
+                    ),
+                    "sparkless_operation": operation,
+                    "effect_outcome": operation.get("effect_outcome"),
+                    "receipt": native.receipt,
+                }
+            )
+            return ExecuteStatementResponse(
+                statement_id=statement_id,
+                status=StatementStatus(state=StatementState.SUCCEEDED),
+                manifest=manifest,
+                result=result_data,
+                created_at=now_ms,
+                started_at=now_ms,
+                ended_at=int(time.time() * 1000),
+                server_instance_id=native.server_instance_id if operation else None,
+                operation_id=native.operation_id if operation else None,
+                effect_outcome=operation.get("effect_outcome"),
+                receipt=native.receipt,
+            )
+        except DatabricksError as e:
+            _record_failure(statement_id, req, disposition, fmt, now_ms, e.error_code, e.message)
+            raise
 
     # Execute SQL synchronously (MVP approach: no background jobs)
     try:
@@ -1041,6 +1271,39 @@ async def get_statement(statement_id: str) -> GetStatementResponse:
 
     stmt = _state["statements"][statement_id]
 
+    # A write whose HTTP response deadline elapsed may still be committing. Poll the
+    # retained Sparkless receipt instead of labeling it failed or resubmitting SQL.
+    operation_ref = stmt.get("sparkless")
+    if operation_ref and stmt.get("status") in {StatementState.PENDING.value, StatementState.RUNNING.value}:
+        from minilake.services import sparkless_adapter
+
+        state, operation = await sparkless_adapter.get_operation_status(
+            operation_ref["server_instance_id"], operation_ref["operation_id"]
+        )
+        if state == "succeeded" and operation:
+            stmt["status"] = StatementState.SUCCEEDED.value
+            stmt["sparkless_operation"] = operation
+            stmt["effect_outcome"] = operation.get("effect_outcome")
+            stmt["receipt"] = operation.get("receipt")
+            stmt["ended_at"] = int(time.time() * 1000)
+            empty_result = ResultData(columns=[], data_array=[], row_count=0, truncated=False)
+            stmt["result"] = empty_result.model_dump()
+            stmt["manifest"] = _build_manifest([], [], stmt.get("format", "JSON_ARRAY")).model_dump(by_alias=True)
+        elif state == "failed" and operation:
+            remote_error = operation.get("error") or {}
+            stmt["status"] = StatementState.FAILED.value
+            stmt["sparkless_operation"] = operation
+            stmt["effect_outcome"] = operation.get("effect_outcome")
+            stmt["receipt"] = operation.get("receipt")
+            stmt["error_code"] = remote_error.get("ename", "SPARKLESS_MUTATION_FAILED").upper()
+            stmt["error_message"] = remote_error.get("evalue", "Sparkless mutation failed")
+            stmt["ended_at"] = int(time.time() * 1000)
+        elif state == "unknown":
+            stmt["status"] = StatementState.FAILED.value
+            stmt["error_code"] = "SPARKLESS_OPERATION_NOT_ACCEPTED"
+            stmt["error_message"] = "Sparkless did not retain this operation identity; no mutation was accepted"
+            stmt["ended_at"] = int(time.time() * 1000)
+
     # Reconstruct result data if present
     result = None
     if stmt.get("result"):
@@ -1064,6 +1327,7 @@ async def get_statement(statement_id: str) -> GetStatementResponse:
         stmt.get("raw_rows", []),
         stmt.get("format", "JSON_ARRAY"),
         stmt.get("raw_column_types"),
+        stmt.get("raw_column_nullability"),
     )
 
     error = stmt.get("error_message")
@@ -1078,6 +1342,10 @@ async def get_statement(statement_id: str) -> GetStatementResponse:
         created_at=stmt.get("created_at"),
         started_at=stmt.get("started_at"),
         ended_at=stmt.get("ended_at"),
+        server_instance_id=(operation_ref or {}).get("server_instance_id"),
+        operation_id=(operation_ref or {}).get("operation_id"),
+        effect_outcome=stmt.get("effect_outcome"),
+        receipt=stmt.get("receipt"),
     )
 
 
@@ -1104,7 +1372,7 @@ async def get_result_chunk(statement_id: str, chunk_index: int, request: Request
     chunk_rows = chunks[chunk_index]
 
     if disposition == "EXTERNAL_LINKS":
-        content, _ = _serialize_chunk(columns, chunk_rows, fmt)
+        content, _ = _serialize_chunk(columns, chunk_rows, fmt, stmt.get("raw_column_types"))
         base = str(request.base_url).rstrip("/")
         link = ExternalLink(
             chunk_index=chunk_index,
@@ -1149,7 +1417,7 @@ async def get_result_chunk_data(statement_id: str, chunk_index: int) -> Response
             status_code=404,
         )
 
-    content, content_type = _serialize_chunk(columns, chunks[chunk_index], fmt)
+    content, content_type = _serialize_chunk(columns, chunks[chunk_index], fmt, stmt.get("raw_column_types"))
     return Response(content=content, media_type=content_type)
 
 

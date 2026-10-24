@@ -135,6 +135,14 @@ async def delete_warehouse(warehouse_id: str) -> dict[str, str]:
             status_code=404,
         )
 
+    # The native service owns a session per warehouse ID. Close that session before
+    # removing the local warehouse so failures remain retryable and saved mutation
+    # receipts stay retained independently by Sparkless.
+    from minilake.services import sparkless_adapter
+
+    if sparkless_adapter.configured():
+        await sparkless_adapter.close_session(warehouse_id)
+
     # Close the DuckDB connection for this warehouse
     pool = get_duckdb_pool()
     if pool:
@@ -164,6 +172,17 @@ def restore_state(data: Dict[str, Any]) -> None:
 async def reset() -> None:
     """Reset warehouses state."""
     global _state
+
+    # Release native Sparkless sessions as well as local DuckDB connections. Session
+    # close only drops temporary state; the native operation registry remains intact.
+    from minilake.services import sparkless_adapter
+
+    if sparkless_adapter.configured():
+        for warehouse_id in list(_state["warehouses"]):
+            try:
+                await sparkless_adapter.close_session(warehouse_id)
+            except Exception as exc:
+                logger.warning(f"Could not close Sparkless session for warehouse {warehouse_id}: {exc}")
 
     # Close all warehouse connections
     pool = get_duckdb_pool()
