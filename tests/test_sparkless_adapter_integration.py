@@ -522,7 +522,7 @@ def test_sdk_returns_pending_for_accepted_mutation_before_deadline_completion(
         json={
             "session": warehouse.id,
             "kind": "sql",
-            "code": "CREATE TABLE accepted_deadline (id BIGINT)",
+            "code": "CREATE TABLE accepted_deadline (value STRING)",
             "server_instance_id": instance_id,
             "operation_id": create_operation_id,
         },
@@ -549,9 +549,9 @@ def test_sdk_returns_pending_for_accepted_mutation_before_deadline_completion(
     assert create_status["effect_outcome"] == "committed", create_status
 
     # Stay below the server's 256 KiB SQL budget while making parsing/staging longer
-    # than the native response deadline.
-    sql = "INSERT INTO accepted_deadline VALUES " + ",".join(f"({value})" for value in range(10_000))
-    assert len(sql.encode()) < 256 * 1024
+    # than the native response deadline, even on a fast runner.
+    sql = "INSERT INTO accepted_deadline VALUES " + ",".join(f"('r{value:018d}')" for value in range(10_000))
+    assert 200 * 1024 < len(sql.encode()) < 256 * 1024
     first_statement = len(minilake_server.fault_proxy.statement_operation_ids)
     result = workspace_client.statement_execution.execute_statement(
         warehouse_id=warehouse.id,
