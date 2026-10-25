@@ -50,6 +50,7 @@ class SparklessFaultProxy:
         self.delayed_operation_ids: list[str] = []
         self.delayed_request_operation_ids: list[str] = []
         self.status_operation_ids: list[str] = []
+        self.operation_status_snapshots: list[tuple[str, str, str]] = []
         self.statement_operation_ids: list[str] = []
         self.forwarded_statement_operation_ids: list[str] = []
         owner = self
@@ -65,6 +66,7 @@ class SparklessFaultProxy:
                 content_length = int(self.headers.get("Content-Length", "0"))
                 request_body = self.rfile.read(content_length)
                 operation_id = None
+                status_operation_id = None
                 if self.path == "/statements":
                     try:
                         payload = json.loads(request_body)
@@ -97,6 +99,17 @@ class SparklessFaultProxy:
                 except requests.RequestException as exc:
                     self.send_error(502, str(exc))
                     return
+
+                if status_operation_id:
+                    try:
+                        status_body = json.loads(upstream.content)
+                    except (TypeError, ValueError):
+                        status_body = {}
+                    owner._record_status_snapshot(
+                        status_operation_id,
+                        str(status_body.get("execution_state", "unknown")),
+                        str(status_body.get("effect_outcome", "unknown")),
+                    )
 
                 if operation_id and upstream.status_code == 200 and owner._should_drop(operation_id):
                     self.close_connection = True
@@ -171,6 +184,10 @@ class SparklessFaultProxy:
     def _record_status(self, operation_id: str) -> None:
         with self._lock:
             self.status_operation_ids.append(operation_id)
+
+    def _record_status_snapshot(self, operation_id: str, state: str, outcome: str) -> None:
+        with self._lock:
+            self.operation_status_snapshots.append((operation_id, state, outcome))
 
     def _record_statement(self, operation_id: str) -> None:
         with self._lock:
@@ -260,6 +277,9 @@ def minilake_server(tmp_path_factory) -> Generator[IntegrationServers, None, Non
             **os.environ,
             "MINILAKE_SPARKLESS_SERVER_URL": fault_proxy.url,
             "MINILAKE_SPARKLESS_REQUEST_TIMEOUT": "5",
+            # Return the first real native status snapshot so deadline integration tests
+            # can observe accepted-but-incomplete operations deterministically.
+            "MINILAKE_SPARKLESS_STATUS_POLLS": "1",
             "MINILAKE_DATA_DIR": str(tmp_path_factory.mktemp("sparkless-minilake-data")),
             "MINILAKE_NOTEBOOK": "0",
             "MINILAKE_MCP": "0",
@@ -484,6 +504,97 @@ def test_adapter_returns_pending_when_request_deadline_precedes_acceptance(
         statement=f"SELECT count(*) AS n FROM {table_name}",
     )
     assert count.result.data_array == [[1]]
+
+
+def test_sdk_returns_pending_for_accepted_mutation_before_deadline_completion(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    # A one-millisecond native response deadline lets the operation continue in its
+    # worker while MiniLake resolves the retained status through the real public route.
+    minilake_server.restart_sparkless({"SPARKLESS_RESPONSE_TIMEOUT_MS": "1"})
+    warehouse = workspace_client.warehouses.create(name="sparkless_accepted_deadline")
+    capabilities = requests.get(f"{minilake_server.sparkless_url}/capabilities", timeout=10).json()
+    instance_id = capabilities["server_instance_id"]
+    create_operation_id = "sdk-accepted-deadline-create-1"
+    create = requests.post(
+        f"{minilake_server.sparkless_url}/statements",
+        json={
+            "session": warehouse.id,
+            "kind": "sql",
+            "code": "CREATE TABLE accepted_deadline (id BIGINT)",
+            "server_instance_id": instance_id,
+            "operation_id": create_operation_id,
+        },
+        timeout=10,
+    )
+    assert create.status_code in {200, 504}, create.text
+
+    def native_status(operation_id: str) -> dict:
+        response = requests.post(
+            f"{minilake_server.sparkless_url}/operations/status",
+            json={"server_instance_id": instance_id, "operation_id": operation_id},
+            timeout=10,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    deadline = time.monotonic() + 10
+    while True:
+        create_status = native_status(create_operation_id)
+        if create_status["execution_state"] != "running":
+            break
+        assert time.monotonic() < deadline, create_status
+        time.sleep(0.01)
+    assert create_status["effect_outcome"] == "committed", create_status
+
+    # Stay below the server's 256 KiB SQL budget while making parsing/staging longer
+    # than the native response deadline.
+    sql = "INSERT INTO accepted_deadline VALUES " + ",".join(f"({value})" for value in range(10_000))
+    assert len(sql.encode()) < 256 * 1024
+    first_statement = len(minilake_server.fault_proxy.statement_operation_ids)
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=sql,
+    )
+
+    assert result.status.state.value == "RUNNING"
+    operation_ids = minilake_server.fault_proxy.statement_operation_ids[first_statement:]
+    assert len(operation_ids) == 1, operation_ids
+    operation_id = operation_ids[0]
+    assert (
+        operation_id,
+        "running",
+        "pending",
+    ) in minilake_server.fault_proxy.operation_status_snapshots
+
+    deadline = time.monotonic() + 20
+    while True:
+        settled = native_status(operation_id)
+        if settled["execution_state"] != "running":
+            break
+        assert time.monotonic() < deadline, settled
+        time.sleep(0.01)
+    assert settled["effect_outcome"] in {"committed", "cancelled"}, settled
+    assert minilake_server.fault_proxy.statement_operation_ids.count(operation_id) == 1
+
+    expected_rows = 10_000 if settled["effect_outcome"] == "committed" else 0
+    deadline = time.monotonic() + 10
+    while True:
+        count = requests.post(
+            f"{minilake_server.sparkless_url}/statements",
+            json={
+                "session": warehouse.id,
+                "kind": "sql",
+                "code": "SELECT COUNT(*) AS n FROM accepted_deadline",
+            },
+            timeout=10,
+        )
+        if count.status_code == 200 and count.json().get("status") == "ok":
+            assert count.json()["data"]["application/json"]["data"] == [[expected_rows]]
+            break
+        assert time.monotonic() < deadline, count.text
+        time.sleep(0.01)
 
 
 def test_sdk_adapter_rejects_reused_identity_with_changed_sql_or_session(
