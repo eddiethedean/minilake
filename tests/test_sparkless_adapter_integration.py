@@ -363,6 +363,80 @@ def test_public_sdk_reads_typed_values_and_mutates_native_catalog(
     assert raw_empty["manifest"]["schema"]["columns"][0]["nullable"] is True
 
 
+def test_public_sdk_identical_submissions_use_distinct_mutation_identities(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_distinct_submissions")
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="CREATE TABLE distinct_submissions (id BIGINT)",
+    )
+    first_operation = len(minilake_server.fault_proxy.statement_operation_ids)
+    statement = "INSERT INTO distinct_submissions VALUES (1)"
+
+    first = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=statement,
+    )
+    second = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=statement,
+    )
+
+    submitted_ids = minilake_server.fault_proxy.statement_operation_ids[first_operation:]
+    assert len(submitted_ids) == 2, submitted_ids
+    assert submitted_ids[0] != submitted_ids[1]
+    assert first.status.state.value == second.status.state.value == "SUCCEEDED"
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT COUNT(*) AS n FROM distinct_submissions",
+    )
+    assert count.result.data_array == [[2]]
+
+
+def test_public_sdk_route_retains_failed_mutation_and_prevents_effects(
+    workspace_client: WorkspaceClient,
+    minilake_server: IntegrationServers,
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_failed_mutation")
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="CREATE TABLE failed_mutation (id INT)",
+    )
+    instance_id = requests.get(f"{minilake_server.sparkless_url}/capabilities", timeout=10).json()["server_instance_id"]
+    operation_id = "sdk-failed-cast-1"
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
+    body = {
+        "warehouse_id": warehouse.id,
+        "statement": "INSERT INTO failed_mutation VALUES ('not-an-integer')",
+        "sparkless_operation_id": operation_id,
+    }
+
+    failed = requests.post(url, json=body, timeout=30)
+    assert failed.status_code == 200, failed.text
+    failed_body = failed.json()
+    assert failed_body["error_code"] == "QUERYERROR"
+    status = requests.post(
+        f"{minilake_server.sparkless_url}/operations/status",
+        json={"server_instance_id": instance_id, "operation_id": operation_id},
+        timeout=10,
+    )
+    assert status.status_code == 200, status.text
+    status_body = status.json()
+    assert status_body["execution_state"] == "failed"
+    assert status_body["effect_outcome"] == "failed"
+
+    replay = requests.post(url, json=body, timeout=30)
+    assert replay.status_code == failed.status_code
+    assert replay.json() == failed_body
+    count = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement="SELECT COUNT(*) AS n FROM failed_mutation",
+    )
+    assert count.result.data_array == [[0]]
+
+
 def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
     workspace_client: WorkspaceClient, minilake_server: IntegrationServers
 ):
