@@ -468,6 +468,53 @@ def test_sdk_adapter_exposes_receipt_and_replays_custom_identity_once(
     assert query.result.data_array == [[1]]
 
 
+def test_public_sdk_route_returns_receipt_for_successful_create_noop(
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_create_noop")
+    url = f"{minilake_server.minilake_url}/api/2.0/sql/statements"
+    created = requests.post(
+        url,
+        json={
+            "warehouse_id": warehouse.id,
+            "statement": "CREATE TABLE noop_receipt (id BIGINT)",
+            "sparkless_operation_id": "sdk-noop-create-1",
+        },
+        timeout=30,
+    )
+    assert created.status_code == 200, created.text
+    created_body = created.json()
+    assert created_body["receipt"]
+
+    no_op = requests.post(
+        url,
+        json={
+            "warehouse_id": warehouse.id,
+            "statement": "CREATE TABLE IF NOT EXISTS noop_receipt (id BIGINT)",
+            "sparkless_operation_id": "sdk-noop-create-2",
+        },
+        timeout=30,
+    )
+    assert no_op.status_code == 200, no_op.text
+    no_op_body = no_op.json()
+    assert no_op_body["operation_id"] == "sdk-noop-create-2"
+    assert no_op_body["receipt"] == created_body["receipt"]
+
+    instance_id = requests.get(
+        f"{minilake_server.sparkless_url}/capabilities", timeout=10
+    ).json()["server_instance_id"]
+    status = requests.post(
+        f"{minilake_server.sparkless_url}/operations/status",
+        json={"server_instance_id": instance_id, "operation_id": "sdk-noop-create-2"},
+        timeout=10,
+    )
+    assert status.status_code == 200, status.text
+    status_body = status.json()
+    assert status_body["execution_state"] == "succeeded"
+    assert status_body["effect_outcome"] == "committed"
+    assert status_body["receipt"] == created_body["receipt"]
+
+
 @pytest.mark.parametrize("failure_mode", ["disconnect", "deadline"])
 def test_adapter_recovers_committed_write_after_real_response_fault(
     workspace_client: WorkspaceClient,
