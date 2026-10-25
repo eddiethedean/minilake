@@ -213,7 +213,7 @@ class IntegrationServers:
     def drop_next_sparkless_response(self, operation_id: str) -> None:
         self.fault_proxy.drop_next_response(operation_id)
 
-    def restart_sparkless(self) -> None:
+    def restart_sparkless(self, env_overrides: dict[str, str] | None = None) -> None:
         current = self.sparkless_processes[-1]
         current.terminate()
         try:
@@ -221,8 +221,11 @@ class IntegrationServers:
         except subprocess.TimeoutExpired:
             current.kill()
             current.wait(timeout=5)
+        environment = os.environ.copy()
+        environment.update(env_overrides or {})
         replacement = subprocess.Popen(
             [str(self.binary), "serve", "--host", "127.0.0.1", "--port", str(self.sparkless_port)],
+            env=environment,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
@@ -651,6 +654,38 @@ def test_restart_rejects_a_retry_bound_to_the_previous_instance(
         statement="SELECT count(*) AS n FROM restart_retry",
     )
     assert count.result.data_array == [[1]]
+
+
+def test_public_sdk_route_preserves_mutation_capacity_failure_without_effects(
+    workspace_client: WorkspaceClient, minilake_server: IntegrationServers
+):
+    warehouse = workspace_client.warehouses.create(name="sparkless_mutation_capacity")
+    minilake_server.restart_sparkless({"SPARKLESS_MAX_MUTATION_RECORDS": "1"})
+    try:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement="CREATE TABLE mutation_capacity (id BIGINT)",
+        )
+
+        response = requests.post(
+            f"{minilake_server.minilake_url}/api/2.0/sql/statements",
+            json={
+                "warehouse_id": warehouse.id,
+                "statement": "INSERT INTO mutation_capacity VALUES (1)",
+                "sparkless_operation_id": "sdk-mutation-capacity-1",
+            },
+            timeout=30,
+        )
+        assert response.status_code == 429, response.text
+        assert response.json()["error_code"] == "MUTATIONRETENTIONCAPACITYEXCEEDED"
+
+        count = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement="SELECT count(*) AS n FROM mutation_capacity",
+        )
+        assert count.result.data_array == [[0]]
+    finally:
+        minilake_server.restart_sparkless({"SPARKLESS_MAX_MUTATION_RECORDS": "1024"})
 
 
 def test_native_decimal_schema_is_preserved_in_arrow_external_link(workspace_client: WorkspaceClient):
