@@ -568,6 +568,11 @@ def test_sdk_returns_pending_for_accepted_mutation_before_deadline_completion(
         "pending",
     ) in minilake_server.fault_proxy.operation_status_snapshots
 
+    # Deleting the warehouse closes its native session while the accepted mutation
+    # still owns a session reference. The operation registry and saved catalog live
+    # independently of that session, so close must not discard its eventual outcome.
+    workspace_client.warehouses.delete(id=warehouse.id)
+
     deadline = time.monotonic() + 20
     while True:
         settled = native_status(operation_id)
@@ -579,21 +584,17 @@ def test_sdk_returns_pending_for_accepted_mutation_before_deadline_completion(
     assert minilake_server.fault_proxy.statement_operation_ids.count(operation_id) == 1
 
     expected_rows = 10_000 if settled["effect_outcome"] == "committed" else 0
+    reader = workspace_client.warehouses.create(name="sparkless_accepted_deadline_reader")
     deadline = time.monotonic() + 10
     while True:
-        count = requests.post(
-            f"{minilake_server.sparkless_url}/statements",
-            json={
-                "session": warehouse.id,
-                "kind": "sql",
-                "code": "SELECT COUNT(*) AS n FROM accepted_deadline",
-            },
-            timeout=10,
+        count = workspace_client.statement_execution.execute_statement(
+            warehouse_id=reader.id,
+            statement="SELECT COUNT(*) AS n FROM accepted_deadline",
         )
-        if count.status_code == 200 and count.json().get("status") == "ok":
-            assert count.json()["data"]["application/json"]["data"] == [[expected_rows]]
+        if count.status.state.value == "SUCCEEDED":
+            assert count.result.data_array == [[expected_rows]]
             break
-        assert time.monotonic() < deadline, count.text
+        assert time.monotonic() < deadline, count
         time.sleep(0.01)
 
 
