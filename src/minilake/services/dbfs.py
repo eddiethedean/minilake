@@ -7,8 +7,12 @@ file on disk persists.
 """
 
 import base64
+import ctypes
+import errno
 import logging
+import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -61,6 +65,52 @@ def _resolve(path: str) -> Path:
     if resolved != root and root not in resolved.parents:
         raise DatabricksError(error_code="INVALID_REQUEST", message="Invalid path", status_code=400)
     return resolved
+
+
+def _rename_without_replace(source: Path, destination: Path) -> None:
+    """Rename a DBFS path without replacing an existing destination."""
+    if os.name == "nt":
+        # Windows os.rename already fails if the destination exists.
+        source.rename(destination)
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        rename = getattr(libc, "renameat2", None)
+        if rename is not None:
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        else:
+            result = -1
+            ctypes.set_errno(errno.ENOSYS)
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is not None:
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            result = rename(os.fsencode(source), os.fsencode(destination), 0x00000004)
+        else:
+            result = -1
+            ctypes.set_errno(errno.ENOSYS)
+    else:
+        result = -1
+        ctypes.set_errno(errno.ENOSYS)
+
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), str(destination))
+    if error_number not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        raise OSError(error_number, os.strerror(error_number), str(destination))
+
+    # Do not fall back to Path.rename here: it can replace a destination created
+    # concurrently after an existence check and silently discard its contents.
+    if destination.exists():
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+    raise NotImplementedError("Exclusive rename is not supported by this filesystem")
 
 
 def _b64_decode(data: str) -> bytes:
@@ -216,7 +266,20 @@ async def move_path(req: MoveDbfsRequest) -> dict:
             error_code="RESOURCE_DOES_NOT_EXIST", message=f"Path '{req.source_path}' not found", status_code=404
         )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    source.rename(destination)
+    try:
+        _rename_without_replace(source, destination)
+    except FileExistsError:
+        raise DatabricksError(
+            error_code="RESOURCE_ALREADY_EXISTS",
+            message=f"Path '{req.destination_path}' already exists",
+            status_code=400,
+        ) from None
+    except NotImplementedError as e:
+        raise DatabricksError(
+            error_code="NOT_IMPLEMENTED",
+            message=f"Cannot move '{req.source_path}': {e}",
+            status_code=501,
+        ) from None
     return {}
 
 
