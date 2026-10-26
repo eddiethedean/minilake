@@ -1,8 +1,8 @@
 """Files API endpoints — real file-backed storage (modern DBFS alternative).
 
-Shares the same on-disk root as DBFS (`settings.data_dir / "dbfs"`), since both
-APIs address the same conceptual filesystem in real Databricks. Unlike DBFS's
-JSON+base64 shape, this API moves raw bytes directly in the HTTP body.
+Ordinary paths share DBFS's on-disk root; `/Volumes/...` paths resolve to their
+Unity Catalog volume directory. Unlike DBFS's JSON+base64 shape, this API moves
+raw bytes directly in the HTTP body.
 """
 
 import logging
@@ -14,6 +14,7 @@ from fastapi import APIRouter, Query, Request, Response
 
 from minilake.config import settings
 from minilake.errors import DatabricksError
+from minilake.services.volume_paths import resolve_volume_path
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ def _normalize(path: str) -> str:
 
 def _resolve(path: str) -> Path:
     normalized = _normalize(path)
+    volume_path = resolve_volume_path(normalized)
+    if volume_path is not None:
+        return volume_path
+
     root = _files_root()
     resolved = (root / normalized.lstrip("/")).resolve()
     if resolved != root and root not in resolved.parents:

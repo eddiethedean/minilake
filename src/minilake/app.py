@@ -151,6 +151,15 @@ async def lifespan(app: FastAPI):
                     except Exception as e:
                         logger.warning(f"Failed to re-attach catalog {catalog_name} on restore: {e}")
 
+        # Older releases stored `/Volumes/...` uploads under dbfs/Volumes,
+        # separate from the directories Unity Catalog creates in volumes/.
+        # Migrate those files before API routes or reset hooks can remove them.
+        from minilake.services.volume_paths import migrate_legacy_volume_data
+
+        migrated_volumes = migrate_legacy_volume_data()
+        if migrated_volumes:
+            logger.info(f"Migrated legacy Files/DBFS data for {migrated_volumes} Unity Catalog volumes")
+
         # Best-effort, non-blocking: pre-pull the Spark image used for real Job
         # execution so the first real job run doesn't pay the cold-start cost.
         asyncio.create_task(asyncio.to_thread(prewarm_spark_image))

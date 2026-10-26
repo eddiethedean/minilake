@@ -1,9 +1,9 @@
 """DBFS (Databricks File System) API endpoints — real file-backed storage.
 
-Files live under `settings.data_dir / "dbfs"`. Chunked upload (create/add-block/
-close) is tracked with a small in-memory handle table, matching the real API's
-session-based upload model — the handle itself is ephemeral, only the final
-file on disk persists.
+Ordinary files live under `settings.data_dir / "dbfs"`; `/Volumes/...` URIs
+resolve to their Unity Catalog volume directory. Chunked upload (create/add-
+block/close) uses an in-memory handle table, matching the real API's session-
+based upload model — only the final file persists.
 """
 
 import base64
@@ -34,6 +34,7 @@ from minilake.models.dbfs import (
     PutDbfsRequest,
     ReadFileResponse,
 )
+from minilake.services.volume_paths import resolve_volume_path
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,10 @@ def _normalize(path: str) -> str:
 
 def _resolve(path: str) -> Path:
     normalized = _normalize(path)
+    volume_path = resolve_volume_path(normalized)
+    if volume_path is not None:
+        return volume_path
+
     root = _dbfs_root()
     resolved = (root / normalized.lstrip("/")).resolve()
     if resolved != root and root not in resolved.parents:
