@@ -87,13 +87,13 @@ def _display_name_taken(display_name: Optional[str], exclude_id: Optional[str] =
     )
 
 
-def _resolve_display_name(display_name: Optional[str]) -> str:
+def _resolve_display_name(display_name: Optional[str], exclude_id: Optional[str] = None) -> str:
     """Append ` (n)` until the name is free, mirroring `auto_resolve_display_name`."""
     base = display_name or "New alert"
-    if not _display_name_taken(base):
+    if not _display_name_taken(base, exclude_id=exclude_id):
         return base
     suffix = 1
-    while _display_name_taken(f"{base} ({suffix})"):
+    while _display_name_taken(f"{base} ({suffix})", exclude_id=exclude_id):
         suffix += 1
     return f"{base} ({suffix})"
 
@@ -362,7 +362,7 @@ async def update_alert(
     display_name = updates.get("display_name")
     if display_name is not None:
         if req.auto_resolve_display_name:
-            updates["display_name"] = _resolve_display_name(display_name)
+            updates["display_name"] = _resolve_display_name(display_name, exclude_id=alert_id)
         elif _display_name_taken(display_name, exclude_id=alert_id):
             raise DatabricksError(
                 error_code="RESOURCE_ALREADY_EXISTS",

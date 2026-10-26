@@ -128,6 +128,35 @@ def test_update_alert_honours_update_mask(workspace_client: WorkspaceClient, cou
 
 
 @pytest.mark.crud
+def test_auto_resolve_display_name_on_update_is_idempotent(workspace_client: WorkspaceClient, counting_query: str):
+    """Updates preserve their name and suffix only for collisions with other alerts."""
+    alert = workspace_client.alerts.create(
+        alert=CreateAlertRequestAlert(display_name="unchanged", query_id=counting_query)
+    )
+
+    for _ in range(2):
+        updated = workspace_client.alerts.update(
+            id=alert.id,
+            update_mask="display_name",
+            auto_resolve_display_name=True,
+            alert=UpdateAlertRequestAlert(display_name="unchanged"),
+        )
+        assert updated.display_name == "unchanged"
+
+    workspace_client.alerts.create(alert=CreateAlertRequestAlert(display_name="occupied", query_id=counting_query))
+    workspace_client.alerts.create(alert=CreateAlertRequestAlert(display_name="occupied (1)", query_id=counting_query))
+
+    for _ in range(2):
+        updated = workspace_client.alerts.update(
+            id=alert.id,
+            update_mask="display_name",
+            auto_resolve_display_name=True,
+            alert=UpdateAlertRequestAlert(display_name="occupied"),
+        )
+        assert updated.display_name == "occupied (2)"
+
+
+@pytest.mark.crud
 def test_delete_alert(workspace_client: WorkspaceClient, counting_query: str):
     created = workspace_client.alerts.create(
         alert=CreateAlertRequestAlert(display_name="doomed", query_id=counting_query)

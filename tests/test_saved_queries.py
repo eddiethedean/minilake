@@ -115,6 +115,35 @@ def test_update_multiple_masked_fields(workspace_client: WorkspaceClient):
 
 
 @pytest.mark.crud
+def test_auto_resolve_display_name_on_update_is_idempotent(workspace_client: WorkspaceClient):
+    """Updates preserve their name and suffix only for collisions with other queries."""
+    query = workspace_client.queries.create(
+        query=CreateQueryRequestQuery(display_name="unchanged", query_text="SELECT 1")
+    )
+
+    for _ in range(2):
+        updated = workspace_client.queries.update(
+            id=query.id,
+            update_mask="display_name",
+            auto_resolve_display_name=True,
+            query=UpdateQueryRequestQuery(display_name="unchanged"),
+        )
+        assert updated.display_name == "unchanged"
+
+    workspace_client.queries.create(query=CreateQueryRequestQuery(display_name="occupied", query_text="SELECT 2"))
+    workspace_client.queries.create(query=CreateQueryRequestQuery(display_name="occupied (1)", query_text="SELECT 3"))
+
+    for _ in range(2):
+        updated = workspace_client.queries.update(
+            id=query.id,
+            update_mask="display_name",
+            auto_resolve_display_name=True,
+            query=UpdateQueryRequestQuery(display_name="occupied"),
+        )
+        assert updated.display_name == "occupied (2)"
+
+
+@pytest.mark.crud
 def test_delete_saved_query(workspace_client: WorkspaceClient):
     """A deleted query is gone from both get and list."""
     created = workspace_client.queries.create(
