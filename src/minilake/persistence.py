@@ -7,6 +7,8 @@ on shutdown (if MINILAKE_PERSIST=1) and reloaded on startup.
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,14 +57,35 @@ async def save_state(
             logger.warning(f"Failed to get state from {name}: {e}")
 
     envelope = StateEnvelope(modules_state)
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-
+    temporary_path = None
     try:
-        with open(snapshot_path, "w") as f:
-            json.dump(envelope.to_dict(), f, indent=2)
+        # Serialize before touching the current snapshot. A non-serializable
+        # module state must not truncate the last good snapshot.
+        snapshot_json = json.dumps(envelope.to_dict(), indent=2)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=snapshot_path.parent,
+            prefix=f".{snapshot_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary_path = Path(f.name)
+            f.write(snapshot_json)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, snapshot_path)
+        temporary_path = None
         logger.info(f"Saved state snapshot to {snapshot_path}")
     except Exception as e:
-        logger.error(f"Failed to save state snapshot: {e}")
+        logger.error(f"Failed to save state snapshot to {snapshot_path}: {e}")
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(f"Failed to remove temporary state snapshot {temporary_path}: {e}")
 
 
 async def load_state(

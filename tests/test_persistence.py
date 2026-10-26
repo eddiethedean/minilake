@@ -10,6 +10,9 @@ state, restarts the process against the same data dir, and verifies the
 state survived — using the real databricks-sdk client throughout.
 """
 
+import asyncio
+import base64
+import json
 import os
 import shutil
 import socket
@@ -22,6 +25,9 @@ import pytest
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.catalog import DataSourceFormat, TableType
 from databricks.sdk.service.sql import ColumnInfo
+
+from minilake import persistence
+from minilake.persistence import save_state
 
 
 def _free_port() -> int:
@@ -87,6 +93,32 @@ def _stop_minilake(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
+def test_save_state_serialization_failure_preserves_previous_snapshot(tmp_path):
+    snapshot_path = tmp_path / "snapshot.json"
+    previous_snapshot = {"format_version": 1, "modules": {"catalogs": {"existing": True}}}
+    snapshot_path.write_text(json.dumps(previous_snapshot))
+
+    asyncio.run(save_state(snapshot_path, {"dbfs": lambda: {"buffer": bytearray(b"pending")}}))
+
+    assert json.loads(snapshot_path.read_text()) == previous_snapshot
+    assert not list(tmp_path.glob(".snapshot.json.*.tmp"))
+
+
+def test_save_state_replace_failure_preserves_previous_snapshot(tmp_path, monkeypatch):
+    snapshot_path = tmp_path / "snapshot.json"
+    previous_snapshot = {"format_version": 1, "modules": {"catalogs": {"existing": True}}}
+    snapshot_path.write_text(json.dumps(previous_snapshot))
+
+    def fail_replace(source, destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(persistence.os, "replace", fail_replace)
+    asyncio.run(save_state(snapshot_path, {"catalogs": lambda: {"current": True}}))
+
+    assert json.loads(snapshot_path.read_text()) == previous_snapshot
+    assert not list(tmp_path.glob(".snapshot.json.*.tmp"))
+
+
 @pytest.mark.serial
 def test_persist_state_survives_restart():
     """Test: MINILAKE_PERSIST=1 really saves state on shutdown and restores
@@ -108,6 +140,27 @@ def test_persist_state_survives_restart():
         client = WorkspaceClient(host=f"http://127.0.0.1:{port}", token="dev", auth_type="pat")
         restored = client.catalogs.get(name=catalog_name)
         assert restored.name == catalog_name
+
+        # An open upload is transient. Shutting down with a bytearray buffer
+        # must not make the snapshot unreadable or discard other saved state.
+        empty_handle = client.dbfs.create("/unfinished_empty.txt", overwrite=True).handle
+        upload_handle = client.dbfs.create("/unfinished.txt", overwrite=True).handle
+        client.dbfs.add_block(upload_handle, base64.b64encode(b"pending").decode("ascii"))
+        _stop_minilake(proc)
+        proc = None
+
+        proc = _start_minilake(port, data_dir)
+        client = WorkspaceClient(host=f"http://127.0.0.1:{port}", token="dev", auth_type="pat")
+        restored = client.catalogs.get(name=catalog_name)
+        assert restored.name == catalog_name
+        for path, handle in (
+            ("/unfinished_empty.txt", empty_handle),
+            ("/unfinished.txt", upload_handle),
+        ):
+            with pytest.raises(Exception):
+                client.dbfs.get_status(path)
+            with pytest.raises(Exception):
+                client.dbfs.add_block(handle, base64.b64encode(b"stale").decode("ascii"))
 
         # And it must be a REAL, still-queryable catalog after restart, not
         # just restored metadata - proves the catalog's DuckDB database was

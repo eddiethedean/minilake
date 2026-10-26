@@ -226,7 +226,10 @@ async def move_path(req: MoveDbfsRequest) -> dict:
 
 
 def get_state() -> Dict[str, Any]:
-    return _state.copy()
+    # Upload handles are transient and their bytearray buffers cannot be
+    # serialized to the JSON persistence snapshot. Only persist the handle
+    # counter; unfinished uploads are intentionally discarded on restart.
+    return {"handles": {}, "next_handle": _state["next_handle"]}
 
 
 def restore_state(data: Dict[str, Any]) -> None:
