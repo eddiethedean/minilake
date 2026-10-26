@@ -101,6 +101,26 @@ def _assignments(key: Tuple[str, Optional[str]]) -> Dict[str, List[str]]:
     return _state["grants"].get(key, {})
 
 
+def delete_grants_for_parent(parent_name: str, parent_type: str) -> None:
+    """Remove grants on a UC object and descendants of that securable type."""
+    parent_type = _normalize_securable(parent_type)
+    parent_depth = _NESTED.get(parent_type)
+    prefix = f"{parent_name}."
+    for key in list(_state["grants"]):
+        securable_type, full_name = key
+        securable_depth = _NESTED.get(securable_type)
+        is_parent = securable_type == parent_type and full_name == parent_name
+        is_descendant = (
+            parent_depth is not None
+            and securable_depth is not None
+            and securable_depth > parent_depth
+            and full_name is not None
+            and full_name.startswith(prefix)
+        )
+        if is_parent or is_descendant:
+            del _state["grants"][key]
+
+
 @router.get("/permissions/{securable_type}/{full_name}", response_model=GetPermissionsResponse)
 async def get_permissions(
     securable_type: str,

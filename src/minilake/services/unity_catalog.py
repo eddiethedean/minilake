@@ -520,12 +520,8 @@ async def delete_catalog(name: str, force: bool = Query(False)) -> dict[str, str
     if volume_path.exists():
         shutil.rmtree(volume_path)
 
-    # Remove all of the catalog's registered children only after the physical catalog
-    # has been detached successfully.
-    for registry in ("schemas", "tables", "external_tables", "volumes", "functions"):
-        for full_name in [k for k in _state[registry] if k.startswith(f"{name}.")]:
-            del _state[registry][full_name]
-
+    # Remove child metadata and grants only after the physical catalog is detached.
+    _remove_child_records(name, ("schemas", "tables", "external_tables", "volumes", "functions"), "CATALOG")
     del _state["catalogs"][name]
     return {"message": f"Catalog '{name}' deleted"}
 
@@ -662,14 +658,22 @@ async def delete_schema(full_name: str, force: bool = Query(False)) -> dict[str,
     if volume_path.exists():
         shutil.rmtree(volume_path)
 
-    # Drop all child metadata after the backing schema was deleted successfully.
-    prefix = f"{full_name}."
-    for registry in ("tables", "external_tables", "volumes", "functions"):
-        for table_name in [k for k in _state[registry] if k.startswith(prefix)]:
-            del _state[registry][table_name]
-
+    # Remove child metadata and grants only after the backing schema is deleted.
+    _remove_child_records(full_name, ("tables", "external_tables", "volumes", "functions"), "SCHEMA")
     del _state["schemas"][full_name]
     return {"message": f"Schema '{full_name}' deleted"}
+
+
+def _remove_child_records(parent_name: str, registries: tuple[str, ...], parent_type: str) -> None:
+    """Remove UC registry entries and grants beneath a deleted catalog or schema."""
+    prefix = f"{parent_name}."
+    for registry in registries:
+        for full_name in [key for key in _state[registry] if key.startswith(prefix)]:
+            del _state[registry][full_name]
+
+    from minilake.services import grants
+
+    grants.delete_grants_for_parent(parent_name, parent_type)
 
 
 # ============================================================================
@@ -1046,6 +1050,9 @@ async def list_volumes(
     schema_name: str = Query(..., alias="schema_name"),
 ) -> ListVolumesResponse:
     """List volumes in a schema."""
+    if catalog_name not in _state["catalogs"] or f"{catalog_name}.{schema_name}" not in _state["schemas"]:
+        return ListVolumesResponse(volumes=[])
+
     records = {
         full_name: record
         for full_name, record in _state["volumes"].items()
@@ -1085,6 +1092,12 @@ def _adopt_unregistered_volume(full_name: str) -> dict:
 async def get_volume(full_name: str) -> VolumeInfo:
     """Get a volume by its three-level (fully qualified) name: catalog.schema.volume."""
     catalog_name, schema_name, name = _split_three_part(full_name, "volume")
+    if catalog_name not in _state["catalogs"] or f"{catalog_name}.{schema_name}" not in _state["schemas"]:
+        raise DatabricksError(
+            error_code="NOT_FOUND",
+            message=f"Volume '{full_name}' not found",
+            status_code=404,
+        )
 
     record = _state["volumes"].get(full_name)
     if record is None:
@@ -1103,7 +1116,13 @@ async def get_volume(full_name: str) -> VolumeInfo:
 @router.patch("/volumes/{full_name}", response_model=VolumeInfo)
 async def update_volume(full_name: str, req: UpdateVolumeRequest) -> VolumeInfo:
     """Update a volume's metadata (comment, properties, owner)."""
-    _split_three_part(full_name, "volume")
+    catalog_name, schema_name, _ = _split_three_part(full_name, "volume")
+    if catalog_name not in _state["catalogs"] or f"{catalog_name}.{schema_name}" not in _state["schemas"]:
+        raise DatabricksError(
+            error_code="NOT_FOUND",
+            message=f"Volume '{full_name}' not found",
+            status_code=404,
+        )
     record = _state["volumes"].get(full_name)
     if record is None:
         raise DatabricksError(
