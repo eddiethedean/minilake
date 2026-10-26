@@ -141,6 +141,47 @@ def test_cluster_with_unknown_policy_rejected(workspace_client: WorkspaceClient)
 
 
 @pytest.mark.error
+@pytest.mark.parametrize(
+    ("invalid_reference", "invalid_id"),
+    [
+        ("policy_id", "NO-SUCH-POLICY"),
+        ("instance_pool_id", "NO-SUCH-POOL"),
+    ],
+)
+def test_invalid_cluster_edit_leaves_record_unchanged(
+    workspace_client: WorkspaceClient,
+    policy_id: str,
+    pool_id: str,
+    invalid_reference: str,
+    invalid_id: str,
+):
+    cluster = workspace_client.clusters.create_and_wait(
+        cluster_name="original",
+        spark_version="13.3.x-scala2.12",
+        node_type_id="local",
+        num_workers=1,
+        policy_id=policy_id,
+        instance_pool_id=pool_id,
+    )
+    before = workspace_client.clusters.get(cluster_id=cluster.cluster_id).as_dict()
+    references = {"policy_id": policy_id, "instance_pool_id": pool_id}
+    references[invalid_reference] = invalid_id
+
+    with pytest.raises(DatabricksError):
+        workspace_client.clusters.edit(
+            cluster_id=cluster.cluster_id,
+            cluster_name="changed",
+            spark_version="14.3.x-scala2.12",
+            node_type_id="changed",
+            num_workers=9,
+            **references,
+        )
+
+    after = workspace_client.clusters.get(cluster_id=cluster.cluster_id).as_dict()
+    assert after == before
+
+
+@pytest.mark.error
 def test_policy_in_use_cannot_be_deleted(workspace_client: WorkspaceClient, policy_id: str, pool_id: str):
     workspace_client.clusters.create(
         cluster_name="holder",

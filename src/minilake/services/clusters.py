@@ -140,21 +140,25 @@ async def create_cluster(req: CreateClusterRequest) -> CreateClusterResponse:
 async def edit_cluster(req: EditClusterRequest) -> ClusterInfo:
     """Edit a cluster's config in place."""
     cluster = _get_or_404(req.cluster_id)
-    cluster["cluster_name"] = req.cluster_name
-    cluster["spark_version"] = req.spark_version
-    cluster["node_type_id"] = req.node_type_id
-    cluster["driver_node_type_id"] = req.driver_node_type_id or req.node_type_id
-    cluster["num_workers"] = req.num_workers
-    cluster["autotermination_minutes"] = req.autotermination_minutes
-    cluster["spark_conf"] = req.spark_conf
-    cluster["spark_env_vars"] = req.spark_env_vars
-    cluster["custom_tags"] = req.custom_tags
-    cluster["autoscale"] = req.autoscale
     _validate_references(req.policy_id, req.instance_pool_id)
-    cluster["policy_id"] = req.policy_id
-    cluster["instance_pool_id"] = req.instance_pool_id
-    cluster["driver_instance_pool_id"] = req.driver_instance_pool_id
-    return _to_info(cluster)
+    updates = {
+        "cluster_name": req.cluster_name,
+        "spark_version": req.spark_version,
+        "node_type_id": req.node_type_id,
+        "driver_node_type_id": req.driver_node_type_id or req.node_type_id,
+        "num_workers": req.num_workers,
+        "autotermination_minutes": req.autotermination_minutes,
+        "spark_conf": req.spark_conf,
+        "spark_env_vars": req.spark_env_vars,
+        "custom_tags": req.custom_tags,
+        "autoscale": req.autoscale,
+        "policy_id": req.policy_id,
+        "instance_pool_id": req.instance_pool_id,
+        "driver_instance_pool_id": req.driver_instance_pool_id,
+    }
+    result = _to_info({**cluster, **updates})
+    cluster.update(updates)
+    return result
 
 
 # Fields `update` may touch, matching the SDK's UpdateClusterResource. Anything else
