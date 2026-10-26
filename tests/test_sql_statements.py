@@ -403,6 +403,35 @@ def test_external_links_arrow_stream_real_fetch(workspace_client: WorkspaceClien
 
 
 @pytest.mark.workflow
+def test_external_links_arrow_stream_preserves_duplicate_column_names(workspace_client: WorkspaceClient):
+    """ARROW_STREAM keeps duplicate result names and their positional values."""
+    import pyarrow as pa
+
+    wh = workspace_client.warehouses.create(name="ext_links_arrow_duplicate_names_wh")
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement="SELECT 1 AS same, 2 AS same",
+        disposition=Disposition.EXTERNAL_LINKS,
+        format=Format.ARROW_STREAM,
+    )
+
+    assert result.manifest.schema.column_count == 2
+    assert [column.name for column in result.manifest.schema.columns] == ["same", "same"]
+
+    link = result.result.external_links[0]
+    resp = requests.get(link.external_link)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/vnd.apache.arrow.stream"
+
+    table = pa.ipc.open_stream(resp.content).read_all()
+    assert table.column_names == ["same", "same"]
+    assert table.num_columns == 2
+    assert table.column(0).to_pylist() == [1]
+    assert table.column(1).to_pylist() == [2]
+
+
+@pytest.mark.workflow
 def test_get_statement_result_chunk_n(workspace_client: WorkspaceClient):
     """get_statement_result_chunk_n fetches real chunk metadata by index."""
     wh = workspace_client.warehouses.create(name="chunk_wh")

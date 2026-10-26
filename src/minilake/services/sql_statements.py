@@ -832,8 +832,8 @@ def _serialize_chunk(columns: List[str], rows: List[List[Any]], fmt: str) -> tup
     if fmt == "ARROW_STREAM":
         import pyarrow as pa
 
-        arrays = [[row[i] for row in rows] for i in range(len(columns))] if rows else [[] for _ in columns]
-        table = pa.table({col: arrays[i] for i, col in enumerate(columns)})
+        arrays = [pa.array([row[i] for row in rows] if rows else []) for i in range(len(columns))]
+        table = pa.Table.from_arrays(arrays, names=columns)
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, table.schema) as writer:
             writer.write_table(table)
