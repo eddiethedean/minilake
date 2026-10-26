@@ -51,6 +51,7 @@ router = APIRouter(prefix="/api/2.2/jobs", tags=["jobs"])
 _state: Dict[str, Any] = {
     "jobs": {},  # job_id (int) -> {job_id, created_time, creator_user_name, settings: dict}
     "runs": {},  # run_id (int) -> {..., "_cancel_requested": bool}
+    "task_outputs": {},  # task run_id (int) -> {logs, error}
     "submit_tokens": {},  # idempotency_token (str) -> run_id, for runs/submit
     "run_now_tokens": {},  # idempotency_token (str) -> run_id, for jobs/run-now
     "next_job_id": 1,
@@ -913,18 +914,15 @@ def get_state() -> Dict[str, Any]:
 
 
 def restore_state(data: Dict[str, Any]) -> None:
-    """Restore state from snapshot, including registries keyed by numeric IDs.
-
-    JSON object keys are always strings. The live jobs state uses integer keys
-    for these registries, so normalize them before serving requests that look
-    up a job, run, or task output by its numeric ID.
-    """
+    """Restore state from snapshot, converting JSON object IDs back to integers."""
     global _state
-    _state.update(data)
-    for registry_name in ("jobs", "runs", "task_outputs"):
-        registry = _state.get(registry_name)
-        if registry is not None:
-            _state[registry_name] = {int(key): value for key, value in registry.items()}
+    restored = data.copy()
+    # JSON object keys are always strings. These registries are indexed by
+    # numeric IDs at runtime, so restore their key types before serving API calls.
+    for registry in ("jobs", "runs", "task_outputs"):
+        if registry in restored:
+            restored[registry] = {int(key): value for key, value in restored[registry].items()}
+    _state.update(restored)
 
 
 async def reset() -> None:
@@ -933,6 +931,7 @@ async def reset() -> None:
     _state = {
         "jobs": {},
         "runs": {},
+        "task_outputs": {},
         "submit_tokens": {},
         "run_now_tokens": {},
         "next_job_id": 1,
