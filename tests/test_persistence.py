@@ -71,7 +71,7 @@ def _wait_healthy(proc: subprocess.Popen, url: str, timeout: float = 60.0) -> No
     raise RuntimeError(f"minilake at {url} did not become healthy in time: {last_error}\n{_drain(proc)}")
 
 
-def _start_minilake(port: int, data_dir: str) -> subprocess.Popen:
+def _start_minilake(port: int, data_dir: str, cwd: str | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["MINILAKE_DATA_DIR"] = data_dir
     env["MINILAKE_PERSIST"] = "1"
@@ -80,6 +80,7 @@ def _start_minilake(port: int, data_dir: str) -> subprocess.Popen:
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=cwd,
     )
     try:
         _wait_healthy(proc, f"http://127.0.0.1:{port}")
@@ -424,3 +425,37 @@ def test_persisted_jobs_runs_and_outputs_survive_restart():
         if proc is not None:
             _stop_minilake(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
+
+
+@pytest.mark.serial
+def test_relative_data_dir_supports_dbfs_and_files(tmp_path):
+    """Relative data roots should work through both real HTTP file APIs."""
+    working_dir = tmp_path / "working_dir"
+    working_dir.mkdir()
+    port = _free_port()
+    proc = _start_minilake(port, "data", cwd=str(working_dir))
+    base_url = f"http://127.0.0.1:{port}"
+    dbfs_path = working_dir / "data" / "dbfs" / "hello"
+    try:
+        dbfs_body = json.dumps({"path": "/hello", "contents": base64.b64encode(b"dbfs").decode("ascii")}).encode()
+        request = urllib.request.Request(
+            f"{base_url}/api/2.0/dbfs/put",
+            data=dbfs_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+        assert dbfs_path.read_bytes() == b"dbfs"
+
+        request = urllib.request.Request(
+            f"{base_url}/api/2.0/fs/files/hello",
+            data=b"files",
+            headers={"Content-Type": "application/octet-stream"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 204
+        assert dbfs_path.read_bytes() == b"files"
+    finally:
+        _stop_minilake(proc)

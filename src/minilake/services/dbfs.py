@@ -66,7 +66,7 @@ def _resolve(path: str) -> Path:
     if volume_path is not None:
         return volume_path
 
-    root = _dbfs_root()
+    root = _dbfs_root().resolve()
     resolved = (root / normalized.lstrip("/")).resolve()
     if resolved != root and root not in resolved.parents:
         raise DatabricksError(error_code="INVALID_REQUEST", message="Invalid path", status_code=400)
@@ -346,7 +346,7 @@ def restore_state(data: Dict[str, Any]) -> None:
 async def reset() -> None:
     global _state
     _state = {"handles": {}, "next_handle": 1}
-    root = _dbfs_root()
+    root = _dbfs_root().resolve()
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
