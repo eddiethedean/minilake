@@ -13,7 +13,7 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.errors import DatabricksError
+from databricks.sdk.errors import BadRequest, DatabricksError
 from databricks.sdk.service.catalog import ColumnInfo, DataSourceFormat, TableType
 from deltalake import DeltaTable, write_deltalake
 
@@ -109,6 +109,77 @@ def test_create_table_using_delta_location_registers_external(
         statement=f"SELECT nome FROM {cat.name}.{schema.name}.{table_name}",
     )
     assert rows.result.data_array == [["x"]]
+
+
+@pytest.mark.workflow
+def test_create_table_using_delta_location_with_comment_registers_external(
+    delta_catalog_and_schema, workspace_client: WorkspaceClient
+):
+    """A comment before USING DELTA must not turn an external table into a managed one."""
+    cat, schema = delta_catalog_and_schema
+    table_name = f"ddl_comment_{uuid4().hex[:6]}"
+    storage_location = f"/data/delta/{cat.name}/{schema.name}/{table_name}"
+
+    write_deltalake(storage_location, pd.DataFrame({"id": [7, 8]}), mode="overwrite")
+
+    warehouse = workspace_client.warehouses.create(name=f"ddl_comment_wh_{uuid4().hex[:6]}")
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=(
+            f"CREATE TABLE {cat.name}./* name separator */{schema.name}.{table_name} (id BIGINT) "
+            f"/* format metadata */ USING DELTA LOCATION '{storage_location}'"
+        ),
+    )
+    assert result.status.state.value == "SUCCEEDED"
+
+    table = workspace_client.tables.get(full_name=f"{cat.name}.{schema.name}.{table_name}")
+    assert table.table_type.value == "EXTERNAL"
+    assert table.storage_location == storage_location
+
+    rows = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"SELECT id FROM {cat.name}.{schema.name}.{table_name} ORDER BY id",
+    )
+    assert rows.status.state.value == "SUCCEEDED"
+    assert rows.result.data_array == [[7], [8]]
+
+
+@pytest.mark.workflow
+def test_unsupported_replace_external_ddl_preserves_existing_table(
+    delta_catalog_and_schema, workspace_client: WorkspaceClient
+):
+    """An unclassified external-table declaration must not erase a managed table."""
+    cat, schema = delta_catalog_and_schema
+    table_name = f"replace_guard_{uuid4().hex[:6]}"
+    storage_location = f"/data/delta/{cat.name}/{schema.name}/replacement_source"
+    write_deltalake(storage_location, pd.DataFrame({"id": [7, 8]}), mode="overwrite")
+
+    warehouse = workspace_client.warehouses.create(name=f"replace_guard_wh_{uuid4().hex[:6]}")
+    create = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {cat.name}.{schema.name}.{table_name} AS SELECT 99::BIGINT AS id",
+    )
+    assert create.status.state.value == "SUCCEEDED"
+
+    with pytest.raises(BadRequest, match='syntax error at or near "USING"'):
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=(
+                f"CREATE OR REPLACE TABLE {cat.name}.{schema.name}.{table_name} (id BIGINT) "
+                f"/* format metadata */ USING DELTA LOCATION '{storage_location}'"
+            ),
+        )
+
+    rows = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"SELECT id FROM {cat.name}.{schema.name}.{table_name}",
+    )
+    assert rows.status.state.value == "SUCCEEDED"
+    assert rows.result.data_array == [[99]]
+
+    table = workspace_client.tables.get(full_name=f"{cat.name}.{schema.name}.{table_name}")
+    assert table.table_type.value == "MANAGED"
+    assert table.storage_location is None
 
 
 @pytest.mark.workflow

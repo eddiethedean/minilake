@@ -344,6 +344,154 @@ def test_catalog_only_namespace_is_not_confused_with_same_named_schema(workspace
 
 
 @pytest.mark.crud
+@pytest.mark.parametrize(
+    "mutation, expected_rows",
+    [
+        pytest.param(
+            "DELETE FROM {table} -- DDL example: ) USING DELTA\nWHERE id = 1",
+            [[2]],
+            id="delete-where-after-comment",
+        ),
+        pytest.param(
+            "UPDATE {table} SET id = id + 10 -- DDL example: ) USING DELTA\nWHERE id = 1",
+            [[2], [11]],
+            id="update-where-after-comment",
+        ),
+    ],
+)
+def test_dml_where_after_ddl_like_comment_is_preserved(workspace_client, mutation, expected_rows):
+    """DDL compatibility rewriting must not truncate DML at comment text."""
+    wh = workspace_client.warehouses.create(name="ddl_comment_dml_wh")
+    table = f"ddl_comment_dml_{uuid.uuid4().hex[:8]}"
+    setup = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"CREATE TABLE {table} AS SELECT 1 AS id UNION ALL SELECT 2",
+    )
+    assert setup.status.state.value == "SUCCEEDED"
+
+    mutation_result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=mutation.format(table=table),
+    )
+    assert mutation_result.status.state.value == "SUCCEEDED"
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"SELECT id FROM {table} ORDER BY id",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == expected_rows
+
+
+@pytest.mark.crud
+def test_ctas_where_after_ddl_like_comment_is_preserved(workspace_client: WorkspaceClient):
+    """A comment in CTAS must not make the compatibility pass remove its filter."""
+    wh = workspace_client.warehouses.create(name="ddl_comment_ctas_wh")
+    source = f"ddl_comment_source_{uuid.uuid4().hex[:8]}"
+    target = f"ddl_comment_target_{uuid.uuid4().hex[:8]}"
+    setup = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"CREATE TABLE {source} AS SELECT 1 AS id UNION ALL SELECT 2",
+    )
+    assert setup.status.state.value == "SUCCEEDED"
+
+    ctas = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=(f"CREATE TABLE {target} AS SELECT id FROM {source} -- DDL example: ) USING DELTA\nWHERE id = 1"),
+    )
+    assert ctas.status.state.value == "SUCCEEDED"
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"SELECT id FROM {target}",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == [[1]]
+
+
+@pytest.mark.crud
+def test_ctas_using_sample_clause_is_preserved(workspace_client: WorkspaceClient):
+    """A CTAS function call must not be mistaken for a DDL column list."""
+    wh = workspace_client.warehouses.create(name="ddl_comment_sample_wh")
+    target = f"ddl_comment_sample_{uuid.uuid4().hex[:8]}"
+
+    ctas = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=(
+            f"CREATE OR REPLACE TABLE {target} AS SELECT * FROM range(100) /* preserve sampling */ USING SAMPLE 0 ROWS"
+        ),
+    )
+    assert ctas.status.state.value == "SUCCEEDED"
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"SELECT count(*) FROM {target}",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == [[0]]
+
+
+@pytest.mark.crud
+def test_delete_comparison_preserves_continued_escape_string(workspace_client: WorkspaceClient):
+    """DDL-like text and semicolons in an E-string must remain literal data."""
+    wh = workspace_client.warehouses.create(name="ddl_comment_escape_wh")
+    table = f"ddl_comment_escape_{uuid.uuid4().hex[:8]}"
+    decoy = f"ddl_comment_decoy_{uuid.uuid4().hex[:8]}"
+    note = f"a'; CREATE TABLE {decoy} (id INTEGER) /* literal data */ USING DELTA; tail"
+    escaped_note = "'" + note.replace("'", "''") + "'"
+
+    setup = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=(f"CREATE TABLE {table} AS SELECT 1 AS id, {escaped_note} AS note UNION ALL SELECT 2, 'other'"),
+    )
+    assert setup.status.state.value == "SUCCEEDED"
+
+    deletion = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=(
+            f"DELETE FROM {table} WHERE note <> E'a'\n"
+            rf"'\'; CREATE TABLE {decoy} (id INTEGER) /* literal data */ USING DELTA; tail'"
+        ),
+    )
+    assert deletion.status.state.value == "SUCCEEDED"
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"SELECT id FROM {table} ORDER BY id",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == [[1]]
+
+
+@pytest.mark.crud
+def test_multistatement_delete_where_after_ddl_like_comment_is_preserved(workspace_client: WorkspaceClient):
+    """Rewriting one DDL statement must preserve a later commented DELETE filter."""
+    wh = workspace_client.warehouses.create(name="ddl_comment_multi_wh")
+    guard = f"ddl_comment_guard_{uuid.uuid4().hex[:8]}"
+    marker = f"ddl_comment_marker_{uuid.uuid4().hex[:8]}"
+    setup = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"CREATE TABLE {guard} AS SELECT 1 AS id UNION ALL SELECT 2",
+    )
+    assert setup.status.state.value == "SUCCEEDED"
+
+    executed = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=(
+            f"CREATE TABLE {marker} (id INTEGER);\nDELETE FROM {guard} -- DDL example: ) USING DELTA\nWHERE id = 1"
+        ),
+    )
+    assert executed.status.state.value == "SUCCEEDED"
+
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=wh.id,
+        statement=f"SELECT id FROM {guard} ORDER BY id",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == [[2]]
+
+
+@pytest.mark.crud
 def test_execute_statement_with_syntax_error(workspace_client: WorkspaceClient):
     """Test: SQL with syntax error returns error status."""
     wh = workspace_client.warehouses.create(name="error_wh")

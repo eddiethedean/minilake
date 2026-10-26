@@ -301,29 +301,169 @@ def _debacktick_identifiers(sql: str) -> str:
     return "".join(parts)
 
 
-# Matches the tail of a Databricks `CREATE TABLE ... (cols) USING DELTA
-# [LOCATION ...] [TBLPROPERTIES ...] ...` statement — clauses DuckDB (which
-# manages storage natively, with no pluggable format) doesn't understand.
-# Requires `\w+` right after USING so `JOIN ... USING (col)` is untouched.
-_CREATE_TABLE_USING_CLAUSE_RE = re.compile(r"\)\s*USING\s+\w+.*\Z", re.IGNORECASE | re.DOTALL)
+def _sql_token_spans(sql: str, include_comments: bool = False) -> List[tuple[Optional[str], int, int, str]]:
+    """Return SQL token spans, skipping whitespace and comments.
+
+    Quoted strings and identifiers are emitted as opaque tokens so punctuation or
+    keywords inside them cannot be mistaken for syntax by the DDL compatibility pass.
+    """
+    tokens = []
+    i = 0
+    while i < len(sql):
+        if _is_duckdb_space(sql[i]):
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            start = i
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+            if include_comments:
+                tokens.append((None, start, i, "comment"))
+            continue
+        if sql.startswith("/*", i):
+            start = i
+            depth = 1
+            i += 2
+            while i < len(sql) and depth:
+                if sql.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif sql.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if include_comments:
+                tokens.append((None, start, i, "comment"))
+            continue
+
+        start = i
+        if sql[i] == "$" and (delimiter := _dollar_quote_delimiter(sql, i)):
+            end = sql.find(delimiter, i + len(delimiter))
+            i = len(sql) if end == -1 else end + len(delimiter)
+            tokens.append((None, start, i, "string"))
+        elif sql[i] in "'\"`":
+            quote = sql[i]
+            backslash_escapes = (
+                quote == "'"
+                and start > 0
+                and sql[start - 1] in "eE"
+                and (start == 1 or not _is_duckdb_identifier_char(sql[start - 2]))
+            )
+            i, closed = _scan_quoted_token(sql, i, quote, backslash_escapes)
+            # DuckDB concatenates quoted string segments separated by a newline.
+            # If the first segment is an E-string, backslash escapes continue in
+            # the following plain segments, including across comments.
+            if quote == "'" and backslash_escapes and closed:
+                while True:
+                    continuation = _skip_string_continuation_whitespace(sql, i)
+                    if continuation is None or continuation >= len(sql) or sql[continuation] != "'":
+                        break
+                    i, closed = _scan_quoted_token(sql, continuation, quote, backslash_escapes=True)
+                    if not closed:
+                        break
+            kind = "identifier" if quote in ('"', "`") else "string"
+            tokens.append((None, start, i, kind))
+        elif _is_duckdb_identifier_char(sql[i]):
+            i += 1
+            while i < len(sql) and _is_duckdb_identifier_char(sql[i]):
+                i += 1
+            tokens.append((sql[start:i].upper(), start, i, "word"))
+        else:
+            i += 1
+            tokens.append((sql[start:i], start, i, "punctuation"))
+    return tokens
+
+
+def _sql_without_comments(sql: str) -> str:
+    """Replace SQL comments with whitespace without changing quoted text."""
+    parts = []
+    cursor = 0
+    for _token, start, end, kind in _sql_token_spans(sql, include_comments=True):
+        if kind != "comment":
+            continue
+        parts.append(sql[cursor:start])
+        parts.append("".join("\n" if char == "\n" else "\r" if char == "\r" else " " for char in sql[start:end]))
+        cursor = end
+    parts.append(sql[cursor:])
+    return "".join(parts)
+
+
+def _strip_databricks_ddl_tail(statement: str) -> str:
+    """Strip a real trailing `USING <format>` clause from one CREATE TABLE."""
+    tokens = _sql_token_spans(statement)
+    if len(tokens) < 4 or tokens[0][0] != "CREATE":
+        return statement
+
+    i = 1
+    if i < len(tokens) and tokens[i][0] == "OR":
+        i += 1
+        if i >= len(tokens) or tokens[i][0] != "REPLACE":
+            return statement
+        i += 1
+    if i < len(tokens) and tokens[i][0] in {"TEMP", "TEMPORARY"}:
+        i += 1
+    if i >= len(tokens) or tokens[i][0] != "TABLE":
+        return statement
+
+    # The first parenthesis after the table name opens its column list. Match its
+    # closing parenthesis so function calls in CTAS queries cannot look like DDL.
+    opening = next((j for j in range(i + 1, len(tokens)) if tokens[j][0] == "("), None)
+    if opening is None:
+        return statement
+    # CTAS queries may contain function calls or subqueries followed by DuckDB
+    # clauses such as `USING SAMPLE`; their parentheses are not a column list.
+    if any(token[0] == "AS" for token in tokens[i + 1 : opening]):
+        return statement
+    depth = 0
+    closing = None
+    for j in range(opening, len(tokens)):
+        if tokens[j][0] == "(":
+            depth += 1
+        elif tokens[j][0] == ")":
+            depth -= 1
+            if depth == 0:
+                closing = j
+                break
+    if closing is None or closing + 2 >= len(tokens):
+        return statement
+
+    using, format_token = tokens[closing + 1], tokens[closing + 2]
+    if using[0] != "USING" or format_token[3] != "word":
+        return statement
+
+    # External-table declarations must be registered before their format tail is
+    # removed. If the classifier above cannot handle a valid variant (for example
+    # CREATE OR REPLACE or a quoted name), leave LOCATION in place so DuckDB rejects
+    # the unsupported statement instead of silently replacing a table without its data.
+    if any(token[0] == "LOCATION" for token in tokens[closing + 3 :]):
+        return statement
+
+    return statement[: tokens[closing][2]]
 
 
 def _strip_databricks_ddl_clauses(sql: str) -> str:
-    """Drop Databricks-only `CREATE TABLE` clauses (`USING <format>` and
-    everything after it, e.g. `LOCATION`, `TBLPROPERTIES`) that the
-    Databricks Terraform provider's generated DDL includes but DuckDB's
-    parser rejects.
+    """Drop Databricks-only table-format tails without changing other SQL.
 
-    `USING DELTA ... LOCATION` is handled before this, by `_classify_create_external`
-    — stripping it here would silently turn an external table into a plain DuckDB one.
+    `USING DELTA ... LOCATION` is handled before this, by `_classify_create_external`.
+    Only an actual `USING <format>` after a CREATE TABLE column list is stripped;
+    matches inside comments, strings, CTAS queries, or later statements are ignored.
     """
-    return _CREATE_TABLE_USING_CLAUSE_RE.sub(")", sql)
+    parts = []
+    cursor = 0
+    for token, start, end, kind in _sql_token_spans(sql):
+        if kind == "punctuation" and token == ";":
+            parts.append(_strip_databricks_ddl_tail(sql[cursor:start]))
+            parts.append(sql[start:end])
+            cursor = end
+    parts.append(_strip_databricks_ddl_tail(sql[cursor:]))
+    return "".join(parts)
 
 
 # `CREATE TABLE cat.sch.tbl (cols) USING <format> [LOCATION '...'] [TBLPROPERTIES ...]`
 _CREATE_USING_RE = re.compile(
     r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-    r"(?P<name>[\w.\"`]+)\s*"
+    r"(?P<name>[\w.\"`]+(?:\s*\.\s*[\w.\"`]+)*)\s*"
     r"\((?P<columns>.*)\)\s*"
     r"USING\s+(?P<format>\w+)"
     r"(?P<tail>.*)\Z",
@@ -341,7 +481,11 @@ def _classify_create_external(sql: str):
     along with everything after it, leaving a plain DuckDB table at no location that UC
     never heard of, and reporting success.
     """
-    match = _CREATE_USING_RE.match(sql.strip())
+    # Token spans omit comments while preserving quoted strings, so comments may
+    # appear anywhere in the DDL without hiding an external-table declaration or
+    # making words inside a LOCATION string look like SQL syntax.
+    without_comments = _sql_without_comments(sql)
+    match = _CREATE_USING_RE.match(without_comments.strip())
     if not match or match.group("format").upper() != "DELTA":
         return None
 
