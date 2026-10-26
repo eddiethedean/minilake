@@ -1194,6 +1194,22 @@ async def execute_statement(req: ExecuteStatementRequest, request: Request) -> E
             )
         except DatabricksError as e:
             _record_failure(statement_id, req, disposition, fmt, now_ms, e.error_code, e.message)
+            if e.status_code == 200:
+                # The native statement protocol reports SQL errors in an HTTP 200
+                # envelope. Translate that into the Statement API's FAILED status so
+                # typed SDK clients don't mistake the response for an empty success.
+                return ExecuteStatementResponse(
+                    statement_id=statement_id,
+                    status=StatementStatus(
+                        state=StatementState.FAILED,
+                        error=ServiceError(error_code=e.error_code, message=e.message),
+                    ),
+                    message=e.message,
+                    created_at=now_ms,
+                    started_at=now_ms,
+                    ended_at=int(time.time() * 1000),
+                    error_code=e.error_code,
+                )
             raise
 
     # Execute SQL synchronously (MVP approach: no background jobs)
@@ -1300,10 +1316,10 @@ async def get_statement(statement_id: str) -> GetStatementResponse:
             stmt["error_message"] = remote_error.get("evalue", "Sparkless mutation failed")
             stmt["ended_at"] = int(time.time() * 1000)
         elif state == "unknown":
-            stmt["status"] = StatementState.FAILED.value
-            stmt["error_code"] = "SPARKLESS_OPERATION_NOT_ACCEPTED"
-            stmt["error_message"] = "Sparkless did not retain this operation identity; no mutation was accepted"
-            stmt["ended_at"] = int(time.time() * 1000)
+            # A 404 only says the operation has not appeared in the native registry
+            # yet. The original request may still be delayed in a proxy and can commit
+            # later, so keep polling instead of claiming it had no effects.
+            pass
 
     # Reconstruct result data if present
     result = None
@@ -1434,6 +1450,15 @@ async def cancel_statement(statement_id: str) -> dict[str, str]:
 
     logger.info(f"Canceling statement {statement_id}")
     stmt = _state["statements"][statement_id]
+    if stmt.get("sparkless") and stmt.get("status") in {
+        StatementState.PENDING.value,
+        StatementState.RUNNING.value,
+    }:
+        raise DatabricksError(
+            error_code="NOT_IMPLEMENTED",
+            message="Sparkless operations cannot be canceled; poll the statement for its final outcome",
+            status_code=501,
+        )
     stmt["status"] = StatementState.CANCELED.value
     stmt["ended_at"] = int(time.time() * 1000)
     return {"message": f"Statement '{statement_id}' canceled"}

@@ -417,6 +417,8 @@ def test_public_sdk_route_retains_failed_mutation_and_prevents_effects(
     assert failed.status_code == 200, failed.text
     failed_body = failed.json()
     assert failed_body["error_code"] == "QUERYERROR"
+    assert failed_body["status"]["state"] == "FAILED"
+    assert failed_body["status"]["error"]["error_code"] == "QUERYERROR"
     status = requests.post(
         f"{minilake_server.sparkless_url}/operations/status",
         json={"server_instance_id": instance_id, "operation_id": operation_id},
@@ -429,7 +431,9 @@ def test_public_sdk_route_retains_failed_mutation_and_prevents_effects(
 
     replay = requests.post(url, json=body, timeout=30)
     assert replay.status_code == failed.status_code
-    assert replay.json() == failed_body
+    replay_body = replay.json()
+    assert replay_body["status"]["state"] == "FAILED"
+    assert replay_body["status"]["error"] == failed_body["status"]["error"]
     count = workspace_client.statement_execution.execute_statement(
         warehouse_id=warehouse.id,
         statement="SELECT COUNT(*) AS n FROM failed_mutation",

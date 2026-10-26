@@ -209,7 +209,12 @@ async def _operation_status(
         return "unavailable", None
     if response.status_code == 404:
         return "unknown", None
-    body = _json(response)
+    try:
+        body = _json(response)
+    except DatabricksError:
+        if response.status_code >= 500:
+            return "unavailable", None
+        raise
     if response.status_code != 200:
         if response.status_code == 409:
             raise DatabricksError(
@@ -309,7 +314,15 @@ async def execute_statement(
             for attempt in range(max_attempts):
                 try:
                     response = await client.post(f"{base_url}/statements", json=body)
-                    last_payload = _json(response)
+                    try:
+                        last_payload = _json(response)
+                    except DatabricksError:
+                        # Gateways commonly replace an upstream error body with HTML or
+                        # plain text. A 5xx is still an ambiguous mutation outcome, so
+                        # consult the retained operation before returning an error.
+                        if response.status_code < 500:
+                            raise
+                        last_payload = {}
                 except httpx.RequestError:
                     state, status = await _recover_accepted_operation(client, base_url, instance_id, operation_id)
                     if state == "succeeded":
@@ -442,6 +455,9 @@ async def execute_statement(
                                 None,
                                 pending=True,
                             )
+                    # Statement execution errors use HTTP 200 with status:error in the
+                    # native protocol. Preserve that distinction for the route layer,
+                    # which returns a Statement API FAILED response for the SDK.
                     _raise_execution_error(last_payload, response.status_code)
                 if response.status_code >= 400:
                     raise _server_error(response, last_payload)
