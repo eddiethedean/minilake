@@ -62,7 +62,7 @@ async def ready() -> ReadyResponse:
     return ReadyResponse(ready=True, message="minilake is ready")
 
 
-# Directories under data_dir that `full=True` wipes.
+# Data directories under data_dir that `full=True` wipes.
 #
 # `catalogs`, `volumes`, `warehouses` and `scratch` are the ones that make `full`
 # mean anything: no service `reset()` touches them, so a plain reset clears the
@@ -80,8 +80,8 @@ def _wipe_data_dirs() -> list[str]:
     """Delete the on-disk trees holding user content. Returns what was removed.
 
     Only safe once every service `reset()` has detached its catalogs and the pool
-    has closed its warehouse connections — deleting a database file out from under
-    an open DuckDB handle is what this ordering avoids.
+    has closed its DuckDB connections — deleting database files out from under an
+    open DuckDB handle is what this ordering avoids.
     """
     removed = []
     for name in _WIPED_ON_FULL_RESET:
@@ -122,9 +122,10 @@ async def reset_state(full: bool = False) -> dict[str, str]:
             except Exception as e:
                 logger.warning(f"Failed to reset {service_name}: {e}")
 
-        # Reset warehouse connections
+        # Reset warehouse connections and, for a full reset, remove the shared
+        # Unity Catalog database after service reset hooks have detached catalogs.
         if _duckdb_pool:
-            await _duckdb_pool.reset_all()
+            await _duckdb_pool.reset_all(full=full)
 
         if full:
             removed = _wipe_data_dirs()

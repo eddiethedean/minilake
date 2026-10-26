@@ -1,6 +1,7 @@
 """Admin endpoints tests (/health, /ready, /reset, /services)."""
 
 import urllib.request
+from uuid import uuid4
 
 import pytest
 from databricks.sdk import WorkspaceClient
@@ -73,6 +74,14 @@ def test_reset_without_full_keeps_files_on_disk(workspace_client: WorkspaceClien
     without `full`, a volume's directory survives and can be listed again after the
     volume is recreated.
     """
+    warehouse = workspace_client.warehouses.create(name="keep_wh")
+    table_name = f"survives_plain_reset_{uuid4().hex}"
+    created = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {table_name} AS SELECT 777 AS value",
+    )
+    assert created.status.state.value == "SUCCEEDED"
+
     workspace_client.catalogs.create(name="keep_cat")
     workspace_client.schemas.create(name="keep_schema", catalog_name="keep_cat")
     workspace_client.volumes.create(
@@ -97,7 +106,15 @@ def test_reset_without_full_keeps_files_on_disk(workspace_client: WorkspaceClien
             volume_type=catalog.VolumeType.MANAGED,
         )
 
-    print("✓ Plain reset left the volume directory on disk")
+    warehouse = workspace_client.warehouses.create(name="keep_wh_after_reset")
+    result = workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"SELECT value FROM {table_name}",
+    )
+    assert result.status.state.value == "SUCCEEDED"
+    assert result.result.data_array == [[777]]
+
+    print("✓ Plain reset left volume files and the shared SQL database intact")
 
 
 @pytest.mark.crud

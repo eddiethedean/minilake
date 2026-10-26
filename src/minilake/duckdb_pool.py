@@ -212,11 +212,27 @@ class DuckDBPool:
 
         logger.info("Closed all DuckDB connections")
 
-    async def reset_all(self) -> None:
-        """Reset all warehouse connections (clear in-memory data, keep UC catalog)."""
+    async def reset_all(self, *, full: bool = False) -> None:
+        """Reset warehouse connections and optionally clear the shared UC database.
+
+        A plain state reset preserves Unity Catalog's default database. A full reset
+        closes its connection and removes both the database and its WAL so the next
+        query starts with a fresh database.
+        """
         async with self._warehouse_dict_lock:
             for conn in self._warehouse_connections.values():
                 conn.close()
             self._warehouse_connections.clear()
             self._warehouse_locks.clear()
+
+        if full:
+            async with self._uc_lock:
+                if self._uc_connection is not None:
+                    self._uc_connection.close()
+                    self._uc_connection = None
+
+                uc_path = self.data_dir / "unity_catalog.duckdb"
+                uc_path.unlink(missing_ok=True)
+                Path(str(uc_path) + ".wal").unlink(missing_ok=True)
+
         logger.info("Reset all warehouse connections")
