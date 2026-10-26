@@ -76,6 +76,18 @@ def _next_id() -> int:
     return obj_id
 
 
+def _file_metadata(normalized: str, object_type: ObjectType) -> dict[str, Any]:
+    """Build complete file metadata before writing the file's contents."""
+    existing = _state["objects"].get(normalized, {})
+    now_ms = int(time.time() * 1000)
+    return {
+        "object_type": object_type.value,
+        "object_id": existing.get("object_id") or _next_id(),
+        "created_at": existing.get("created_at") or now_ms,
+        "modified_at": now_ms,
+    }
+
+
 def _directory_object_id(normalized: str) -> int:
     """Get (lazily assigning and caching) a directory's object_id.
 
@@ -155,22 +167,23 @@ async def import_object(req: ImportWorkspaceRequest) -> dict:
             status_code=400,
         )
 
+    if file_path.is_dir():
+        raise DatabricksError(
+            error_code="INVALID_REQUEST",
+            message=f"Path '{normalized}' is a directory",
+            status_code=400,
+        )
+
     file_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         content_bytes = base64.b64decode(req.content, validate=True) if req.content else b""
     except Exception as e:
         raise DatabricksError(error_code="INVALID_REQUEST", message=f"Invalid base64 content: {e}", status_code=400)
-    file_path.write_bytes(content_bytes)
 
-    now_ms = int(time.time() * 1000)
-    existing = _state["objects"].get(normalized)
-    _state["objects"][normalized] = {
-        "object_type": ObjectType.NOTEBOOK.value,
-        "object_id": existing["object_id"] if existing else _next_id(),
-        "language": Language.PYTHON.value,
-        "created_at": existing["created_at"] if existing else now_ms,
-        "modified_at": now_ms,
-    }
+    metadata = _file_metadata(normalized, ObjectType.NOTEBOOK)
+    metadata["language"] = Language.PYTHON.value
+    file_path.write_bytes(content_bytes)
+    _state["objects"][normalized] = metadata
 
     logger.info(f"Imported workspace object: {normalized}")
     return {}
@@ -193,6 +206,13 @@ async def import_file(
     normalized = _normalize("/" + path)
     file_path = _resolve(normalized)
 
+    if file_path.is_dir():
+        raise DatabricksError(
+            error_code="INVALID_REQUEST",
+            message=f"Path '{normalized}' is a directory",
+            status_code=400,
+        )
+
     if file_path.exists() and not file_path.is_dir() and not overwrite:
         raise DatabricksError(
             error_code="RESOURCE_ALREADY_EXISTS",
@@ -202,16 +222,9 @@ async def import_file(
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
     body = await request.body()
+    metadata = _file_metadata(normalized, ObjectType.FILE)
     file_path.write_bytes(body)
-
-    now_ms = int(time.time() * 1000)
-    existing = _state["objects"].get(normalized)
-    _state["objects"][normalized] = {
-        "object_type": ObjectType.FILE.value,
-        "object_id": existing["object_id"] if existing else _next_id(),
-        "created_at": existing["created_at"] if existing else now_ms,
-        "modified_at": now_ms,
-    }
+    _state["objects"][normalized] = metadata
 
     logger.info(f"Imported workspace file: {normalized}")
     return {}
@@ -385,6 +398,7 @@ async def delete_object(req: DeleteWorkspaceRequest) -> dict:
                 status_code=400,
             )
         shutil.rmtree(target)
+        _state["objects"].pop(normalized, None)
         prefix = normalized.rstrip("/") + "/"
         for key in list(_state["objects"].keys()):
             if key.startswith(prefix):

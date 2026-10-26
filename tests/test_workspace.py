@@ -4,6 +4,7 @@ import base64
 
 import pytest
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.workspace import ImportFormat, Language
 
 SAMPLE_SCRIPT = b"print('hello from minilake workspace test')\n"
@@ -80,6 +81,50 @@ def test_workspace_mkdirs_and_delete(workspace_client: WorkspaceClient):
         workspace_client.workspace.get_status(path="/Shared/to_delete")
 
     print("✓ Workspace mkdirs/delete works for real")
+
+
+@pytest.mark.workflow
+def test_workspace_deleted_directory_can_be_reused_for_notebook(workspace_client: WorkspaceClient):
+    path = "/Shared/replaced_directory.py"
+    workspace_client.workspace.mkdirs(path=path)
+    old_directory = workspace_client.workspace.get_status(path=path)
+    workspace_client.workspace.delete(path=path, recursive=True)
+
+    workspace_client.workspace.import_(
+        path=path,
+        content=base64.b64encode(SAMPLE_SCRIPT).decode("ascii"),
+        format=ImportFormat.SOURCE,
+        language=Language.PYTHON,
+        overwrite=True,
+    )
+
+    status = workspace_client.workspace.get_status(path=path)
+    assert status.object_type.value == "NOTEBOOK"
+    assert status.object_id != old_directory.object_id
+    assert status.created_at is not None
+    assert base64.b64decode(workspace_client.workspace.export(path=path).content) == SAMPLE_SCRIPT
+
+
+@pytest.mark.error
+def test_workspace_notebook_import_does_not_replace_directory(workspace_client: WorkspaceClient):
+    path = "/Shared/not_a_notebook_directory"
+    workspace_client.workspace.mkdirs(path=path)
+    before = workspace_client.workspace.get_status(path=path)
+
+    with pytest.raises(DatabricksError) as error:
+        workspace_client.workspace.import_(
+            path=path,
+            content=base64.b64encode(SAMPLE_SCRIPT).decode("ascii"),
+            format=ImportFormat.SOURCE,
+            language=Language.PYTHON,
+            overwrite=False,
+        )
+
+    assert error.value.error_code == "RESOURCE_ALREADY_EXISTS"
+    after = workspace_client.workspace.get_status(path=path)
+    assert after.object_type.value == "DIRECTORY"
+    assert after.object_id == before.object_id
+    assert list(workspace_client.workspace.list(path=path)) == []
 
 
 @pytest.mark.error

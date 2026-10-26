@@ -57,6 +57,38 @@ def test_imported_file_reports_object_type_file(workspace_client: WorkspaceClien
     print("✓ synced file reports object_type=FILE")
 
 
+@pytest.mark.workflow
+def test_workspace_file_deleted_directory_can_be_reused(workspace_client: WorkspaceClient):
+    path = "/Shared/replaced_directory.txt"
+    content = b"file after directory deletion"
+    workspace_client.workspace.mkdirs(path=path)
+    old_directory = workspace_client.workspace.get_status(path=path)
+    workspace_client.workspace.delete(path=path, recursive=True)
+
+    _import_file(workspace_client, path, content)
+
+    status = workspace_client.workspace.get_status(path=path)
+    assert status.object_type.value == "FILE"
+    assert status.object_id != old_directory.object_id
+    assert status.created_at is not None
+    assert _read_file(workspace_client, path) == content
+
+
+@pytest.mark.error
+def test_workspace_file_import_does_not_replace_directory(workspace_client: WorkspaceClient):
+    path = "/Shared/not_a_file_directory"
+    workspace_client.workspace.mkdirs(path=path)
+    before = workspace_client.workspace.get_status(path=path)
+
+    with pytest.raises(Exception):
+        _import_file(workspace_client, path, b"file content")
+
+    after = workspace_client.workspace.get_status(path=path)
+    assert after.object_type.value == "DIRECTORY"
+    assert after.object_id == before.object_id
+    assert list(workspace_client.workspace.list(path=path)) == []
+
+
 @pytest.mark.error
 def test_import_file_overwrite_false_conflicts(workspace_client: WorkspaceClient):
     """Re-importing without overwrite raises (RESOURCE_ALREADY_EXISTS / 400)."""
