@@ -159,6 +159,106 @@ def _split_three_part(full_name: str, kind: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
+def _directory_has_children(path: Path) -> bool:
+    """Whether a volume directory contains a volume or other on-disk content."""
+    try:
+        return next(path.iterdir(), None) is not None
+    except FileNotFoundError:
+        return False
+
+
+def _schema_has_registered_children(catalog_name: str, schema_name: str) -> bool:
+    full_name = f"{catalog_name}.{schema_name}"
+    prefix = f"{full_name}."
+    for registry in ("tables", "external_tables", "volumes", "functions"):
+        if any(name.startswith(prefix) for name in _state[registry]):
+            return True
+
+    # Volumes are directories, so they can outlive the in-memory registry (for example,
+    # after restarting without snapshot persistence). An empty volume directory still
+    # represents a child and must be explicitly deleted before a non-forced schema drop.
+    return _directory_has_children(_get_volumes_dir() / catalog_name / schema_name)
+
+
+def _catalog_has_registered_children(catalog_name: str) -> bool:
+    prefix = f"{catalog_name}."
+    # Catalog creation always adds this synthetic default schema. Its existence alone
+    # must not make an otherwise empty catalog undeletable.
+    if any(name.startswith(prefix) and name != f"{catalog_name}.default" for name in _state["schemas"]):
+        return True
+    for registry in ("tables", "external_tables", "volumes", "functions"):
+        if any(name.startswith(prefix) for name in _state[registry]):
+            return True
+
+    # Count volume directories, including volumes whose registry entry was lost. Empty
+    # schema directories left after volume deletion do not prevent catalog deletion.
+    catalog_volumes = _get_volumes_dir() / catalog_name
+    try:
+        for schema_path in catalog_volumes.iterdir():
+            if not schema_path.is_dir() or _directory_has_children(schema_path):
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def _duckdb_schema_has_children(conn, catalog_name: str, schema_name: str) -> bool:
+    """Check DuckDB objects that can be removed by DROP SCHEMA, including raw SQL DDL."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM information_schema.tables
+        WHERE table_catalog = ? AND table_schema = ?
+        UNION ALL
+        SELECT 1 FROM duckdb_sequences()
+        WHERE database_name = ? AND schema_name = ?
+        UNION ALL
+        SELECT 1 FROM duckdb_functions()
+        WHERE database_name = ? AND schema_name = ?
+        UNION ALL
+        SELECT 1 FROM duckdb_types()
+        WHERE database_name = ? AND schema_name = ? AND NOT internal
+        LIMIT 1
+        """,
+        [catalog_name, schema_name] * 4,
+    ).fetchone()
+    return row is not None
+
+
+def _duckdb_catalog_has_children(conn, catalog_name: str) -> bool:
+    """Check attached database objects, including objects created outside the UC API."""
+    if conn.execute(
+        """
+        SELECT 1 FROM information_schema.schemata
+        WHERE catalog_name = ?
+          AND schema_name NOT IN ('main', 'default', 'information_schema', 'pg_catalog')
+        LIMIT 1
+        """,
+        [catalog_name],
+    ).fetchone():
+        return True
+
+    for schema_name in ("main", "default"):
+        if _duckdb_schema_has_children(conn, catalog_name, schema_name):
+            return True
+    return False
+
+
+def _not_empty_error(kind: str, name: str) -> DatabricksError:
+    return DatabricksError(
+        error_code="INVALID_STATE",
+        message=f"{kind.capitalize()} '{name}' is not empty; set force=true to delete it",
+        status_code=409,
+    )
+
+
+def _inspection_error(kind: str, name: str, error: Exception) -> DatabricksError:
+    return DatabricksError(
+        error_code="INVALID_STATE",
+        message=f"Could not verify whether {kind} '{name}' is empty; no deletion was performed: {error}",
+        status_code=500,
+    )
+
+
 async def _managed_table_exists(catalog_name: str, schema_name: str, table_name: str) -> bool:
     """Whether a native DuckDB table exists, regardless of what UC knows about it."""
     pool = get_duckdb_pool()
@@ -380,25 +480,51 @@ async def update_catalog(name: str, req: UpdateCatalogRequest) -> CatalogInfo:
 
 
 @router.delete("/catalogs/{name}")
-async def delete_catalog(name: str) -> dict[str, str]:
-    """Delete a catalog."""
+async def delete_catalog(name: str, force: bool = Query(False)) -> dict[str, str]:
+    """Delete a catalog, requiring force when it contains child objects."""
     if name not in _state["catalogs"]:
         raise DatabricksError(
             error_code="NOT_FOUND",
             message=f"Catalog '{name}' not found",
             status_code=404,
         )
-    # Also drop this catalog's schemas, tables and volumes from in-memory state.
-    for registry in ("schemas", "tables", "external_tables", "volumes"):
-        for full_name in [k for k in _state[registry] if k.startswith(f"{name}.")]:
-            del _state[registry][full_name]
 
     pool = get_duckdb_pool()
     if pool:
         try:
-            await pool.detach_catalog(name)
+            # Attach first so a persisted catalog that is not currently attached is
+            # inspected before its file can be removed.
+            await pool.attach_catalog(name)
+            can_detach = None
+            if not force:
+
+                def catalog_is_empty(conn):
+                    return not _catalog_has_registered_children(name) and not _duckdb_catalog_has_children(conn, name)
+
+                can_detach = catalog_is_empty
+            detached = await pool.detach_catalog(name, can_detach=can_detach)
         except Exception as e:
-            logger.warning(f"Failed to detach catalog {name} in DuckDB: {e}")
+            if not force:
+                raise _inspection_error("catalog", name, e) from e
+            raise DatabricksError(
+                error_code="INVALID_STATE",
+                message=f"Could not delete catalog '{name}': {e}",
+                status_code=500,
+            ) from e
+        if not detached:
+            raise _not_empty_error("catalog", name)
+    elif not force and _catalog_has_registered_children(name):
+        raise _not_empty_error("catalog", name)
+
+    volume_path = _get_volumes_dir() / name
+    if volume_path.exists():
+        shutil.rmtree(volume_path)
+
+    # Remove all of the catalog's registered children only after the physical catalog
+    # has been detached successfully.
+    for registry in ("schemas", "tables", "external_tables", "volumes", "functions"):
+        for full_name in [k for k in _state[registry] if k.startswith(f"{name}.")]:
+            del _state[registry][full_name]
 
     del _state["catalogs"][name]
     return {"message": f"Catalog '{name}' deleted"}
@@ -497,8 +623,8 @@ async def update_schema(full_name: str, req: UpdateSchemaRequest) -> SchemaInfo:
 
 
 @router.delete("/schemas/{full_name}")
-async def delete_schema(full_name: str) -> dict[str, str]:
-    """Delete a schema."""
+async def delete_schema(full_name: str, force: bool = Query(False)) -> dict[str, str]:
+    """Delete a schema, requiring force when it contains child objects."""
     if full_name not in _state["schemas"]:
         raise DatabricksError(
             error_code="NOT_FOUND",
@@ -506,21 +632,39 @@ async def delete_schema(full_name: str) -> dict[str, str]:
             status_code=404,
         )
 
-    # Delete from DuckDB
+    cat, schema = full_name.split(".", 1)
     pool = get_duckdb_pool()
     if pool:
-        cat, schema = full_name.split(".", 1)
         try:
+            await pool.attach_catalog(cat)
             conn = await pool.get_uc_connection()
             async with await pool.get_uc_lock():
-                conn.execute(f'DROP SCHEMA IF EXISTS "{cat}"."{schema}" CASCADE')
+                if not force and (
+                    _schema_has_registered_children(cat, schema) or _duckdb_schema_has_children(conn, cat, schema)
+                ):
+                    raise _not_empty_error("schema", full_name)
+                drop_mode = "CASCADE" if force else "RESTRICT"
+                conn.execute(f'DROP SCHEMA IF EXISTS "{cat}"."{schema}" {drop_mode}')
+        except DatabricksError:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to drop schema in DuckDB: {e}")
+            if not force:
+                raise _inspection_error("schema", full_name, e) from e
+            raise DatabricksError(
+                error_code="INVALID_STATE",
+                message=f"Could not delete schema '{full_name}': {e}",
+                status_code=500,
+            ) from e
+    elif not force and _schema_has_registered_children(cat, schema):
+        raise _not_empty_error("schema", full_name)
 
-    # Drop the schema's tables from both registries. Leaving external_tables behind kept
-    # the table queryable through delta_scan() after its schema was gone.
+    volume_path = _get_volumes_dir() / cat / schema
+    if volume_path.exists():
+        shutil.rmtree(volume_path)
+
+    # Drop all child metadata after the backing schema was deleted successfully.
     prefix = f"{full_name}."
-    for registry in ("tables", "external_tables"):
+    for registry in ("tables", "external_tables", "volumes", "functions"):
         for table_name in [k for k in _state[registry] if k.startswith(prefix)]:
             del _state[registry][table_name]
 

@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import duckdb
 
@@ -128,17 +128,41 @@ class DuckDBPool:
         async with self._uc_lock:
             conn.execute(f"ATTACH IF NOT EXISTS '{path}' AS \"{catalog_name}\"")
 
-    async def detach_catalog(self, catalog_name: str) -> None:
-        """DETACH a catalog and delete its underlying DuckDB file for real."""
+    async def detach_catalog(
+        self,
+        catalog_name: str,
+        *,
+        can_detach: Optional[Callable[[object], bool]] = None,
+    ) -> bool:
+        """Detach a catalog and delete its underlying DuckDB file.
+
+        ``can_detach`` runs while holding the UC connection lock, immediately before
+        DETACH. Callers can use it to make an emptiness check atomic with the detach.
+        It returns False without changing the catalog when the check fails.
+        """
         conn = await self.get_uc_connection()
         async with self._uc_lock:
-            try:
+            attachment = conn.execute(
+                "SELECT path FROM duckdb_databases() WHERE database_name = ?",
+                [catalog_name],
+            ).fetchone()
+            expected_path = self._catalog_db_path(catalog_name).resolve()
+            if can_detach is not None and attachment is None:
+                raise RuntimeError(f"Catalog '{catalog_name}' is not attached for emptiness inspection")
+            if attachment is not None:
+                attached_path = attachment[0]
+                if not attached_path or Path(attached_path).resolve() != expected_path:
+                    raise RuntimeError(
+                        f"Catalog '{catalog_name}' is attached to '{attached_path}', not its backing file '{expected_path}'"
+                    )
+            if can_detach is not None and not can_detach(conn):
+                return False
+            if attachment:
                 conn.execute(f'DETACH "{catalog_name}"')
-            except Exception as e:
-                logger.warning(f"Failed to detach catalog {catalog_name} (non-critical): {e}")
         path = self._catalog_db_path(catalog_name)
         path.unlink(missing_ok=True)
         Path(str(path) + ".wal").unlink(missing_ok=True)
+        return True
 
     async def get_warehouse_connection(self, warehouse_id: str) -> duckdb.DuckDBPyConnection:
         """Get or create a connection for a specific warehouse."""

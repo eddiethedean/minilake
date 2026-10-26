@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import VolumeType
 
 
@@ -63,3 +64,36 @@ def test_volume_create_under_nonexistent_schema_fails(catalog, workspace_client:
         )
 
     print("✓ Volume create under nonexistent schema raises error")
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_schema_delete_requires_force_for_volume(catalog_and_schema, workspace_client: WorkspaceClient):
+    cat, schema = catalog_and_schema
+    volume_name = f"preserve_{uuid4().hex[:8]}"
+    full_name = f"{cat.name}.{schema.name}.{volume_name}"
+    workspace_client.volumes.create(
+        name=volume_name,
+        catalog_name=cat.name,
+        schema_name=schema.name,
+        volume_type=VolumeType.MANAGED,
+    )
+
+    try:
+        with pytest.raises(DatabricksError, match="not empty"):
+            workspace_client.schemas.delete(full_name=schema.full_name, force=False)
+
+        assert workspace_client.volumes.read(name=full_name).name == volume_name
+
+        workspace_client.schemas.delete(full_name=schema.full_name, force=True)
+        with pytest.raises(DatabricksError):
+            workspace_client.volumes.read(name=full_name)
+    finally:
+        try:
+            workspace_client.volumes.delete(name=full_name)
+        except Exception:
+            pass
+        try:
+            workspace_client.schemas.delete(full_name=schema.full_name, force=True)
+        except Exception:
+            pass

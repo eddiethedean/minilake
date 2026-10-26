@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 
 
 @pytest.mark.crud
@@ -69,6 +70,84 @@ def test_catalog_delete_removes_from_list(workspace_client: WorkspaceClient):
     assert not any(c.name == cat_name for c in catalogs_after)
 
     print(f"✓ Catalog deleted: {cat_name}")
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_catalog_delete_without_force_preserves_sql_created_table(catalog, workspace_client: WorkspaceClient):
+    """Omitting force must reject a populated catalog without deleting its database."""
+    table_name = f"preserve_{uuid4().hex[:8]}"
+    warehouse = workspace_client.warehouses.create(name=f"delete_wh_{uuid4().hex[:6]}", cluster_size="Small")
+
+    try:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f'CREATE TABLE "{catalog.name}"."default"."{table_name}" AS SELECT 42 AS id',
+        )
+
+        # This exercises the SDK's omitted-force request, which must behave as false.
+        with pytest.raises(DatabricksError, match="not empty"):
+            workspace_client.catalogs.delete(name=catalog.name)
+
+        result = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f'SELECT id FROM "{catalog.name}"."default"."{table_name}"',
+        )
+        assert result.result.data_array == [[42]]
+
+        workspace_client.catalogs.delete(name=catalog.name, force=True)
+        with pytest.raises(DatabricksError):
+            workspace_client.statement_execution.execute_statement(
+                warehouse_id=warehouse.id,
+                statement=f'SELECT id FROM "{catalog.name}"."default"."{table_name}"',
+            )
+    finally:
+        try:
+            workspace_client.catalogs.delete(name=catalog.name, force=True)
+        except Exception:
+            pass
+        workspace_client.warehouses.delete(id=warehouse.id)
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_catalog_delete_rejects_replaced_attachment(catalog, workspace_client: WorkspaceClient):
+    """A same-name attachment to another database must not let deletion unlink this catalog."""
+    table_name = f"preserve_{uuid4().hex[:8]}"
+    warehouse = workspace_client.warehouses.create(name=f"delete_wh_{uuid4().hex[:6]}", cluster_size="Small")
+
+    def execute(statement):
+        return workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=statement,
+        )
+
+    try:
+        execute(f'CREATE TABLE "{catalog.name}"."default"."{table_name}" AS SELECT 42 AS id')
+        execute(f'DETACH "{catalog.name}"')
+        execute(f"ATTACH ':memory:' AS \"{catalog.name}\"")
+
+        with pytest.raises(DatabricksError):
+            workspace_client.catalogs.delete(name=catalog.name)
+
+        # Once the conflicting alias is removed, deletion must attach and inspect the
+        # original file, proving that the failed request left its table intact.
+        execute(f'DETACH "{catalog.name}"')
+        with pytest.raises(DatabricksError, match="not empty"):
+            workspace_client.catalogs.delete(name=catalog.name)
+
+        result = execute(f'SELECT id FROM "{catalog.name}"."default"."{table_name}"')
+        assert result.result.data_array == [[42]]
+    finally:
+        try:
+            execute(f'DETACH "{catalog.name}"')
+        except Exception:
+            pass
+        try:
+            workspace_client.catalogs.delete(name=catalog.name, force=True)
+        except Exception:
+            pass
+        workspace_client.warehouses.delete(id=warehouse.id)
 
 
 @pytest.mark.error

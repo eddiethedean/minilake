@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 
 
 @pytest.mark.crud
@@ -72,6 +73,43 @@ def test_schema_delete_removes_from_list(catalog, workspace_client: WorkspaceCli
     assert not any(s.name == schema_name for s in schemas_after)
 
     print(f"✓ Schema deleted: {schema_name}")
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_schema_delete_requires_force_for_sql_created_table(catalog_and_schema, workspace_client: WorkspaceClient):
+    """A raw SQL table must survive a rejected non-forced schema deletion."""
+    cat, schema = catalog_and_schema
+    table_name = f"preserve_{uuid4().hex[:8]}"
+    warehouse = workspace_client.warehouses.create(name=f"delete_wh_{uuid4().hex[:6]}", cluster_size="Small")
+
+    try:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f'CREATE TABLE "{cat.name}"."{schema.name}"."{table_name}" AS SELECT 42 AS id',
+        )
+
+        with pytest.raises(DatabricksError, match="not empty"):
+            workspace_client.schemas.delete(full_name=schema.full_name, force=False)
+
+        result = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f'SELECT id FROM "{cat.name}"."{schema.name}"."{table_name}"',
+        )
+        assert result.result.data_array == [[42]]
+
+        workspace_client.schemas.delete(full_name=schema.full_name, force=True)
+        with pytest.raises(DatabricksError):
+            workspace_client.statement_execution.execute_statement(
+                warehouse_id=warehouse.id,
+                statement=f'SELECT id FROM "{cat.name}"."{schema.name}"."{table_name}"',
+            )
+    finally:
+        try:
+            workspace_client.schemas.delete(full_name=schema.full_name, force=True)
+        except Exception:
+            pass
+        workspace_client.warehouses.delete(id=warehouse.id)
 
 
 @pytest.mark.error

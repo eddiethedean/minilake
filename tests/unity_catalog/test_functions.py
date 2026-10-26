@@ -115,6 +115,22 @@ def test_deleting_a_function_drops_the_macro(workspace_client: WorkspaceClient, 
         )
 
 
+@pytest.mark.serial
+def test_schema_delete_requires_force_for_function(workspace_client: WorkspaceClient, catalog_and_schema):
+    cat, schema = catalog_and_schema
+    full_name = f"{cat.name}.{schema.name}.preserve_fn"
+    workspace_client.functions.create(function_info=_sql_function("preserve_fn", cat.name, schema.name, "amount"))
+
+    with pytest.raises(DatabricksError, match="not empty"):
+        workspace_client.schemas.delete(full_name=schema.full_name, force=False)
+
+    assert workspace_client.functions.get(name=full_name).full_name == full_name
+
+    workspace_client.schemas.delete(full_name=schema.full_name, force=True)
+    with pytest.raises(DatabricksError):
+        workspace_client.functions.get(name=full_name)
+
+
 @pytest.mark.crud
 def test_update_function_owner(workspace_client: WorkspaceClient, catalog_and_schema):
     cat, schema = catalog_and_schema
