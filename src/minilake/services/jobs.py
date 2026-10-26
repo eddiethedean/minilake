@@ -51,6 +51,7 @@ _state: Dict[str, Any] = {
     "jobs": {},  # job_id (int) -> {job_id, created_time, creator_user_name, settings: dict}
     "runs": {},  # run_id (int) -> {..., "_cancel_requested": bool}
     "submit_tokens": {},  # idempotency_token (str) -> run_id, for runs/submit
+    "run_now_tokens": {},  # idempotency_token (str) -> run_id, for jobs/run-now
     "next_job_id": 1,
     "next_run_id": 1,
 }
@@ -612,6 +613,19 @@ async def _execute_run(run_id: int, argv: List[str]) -> None:
 @router.post("/run-now", response_model=RunNowResponse)
 async def run_now(req: RunNowRequest) -> RunNowResponse:
     """Trigger a job run. Executes tasks for real in the background."""
+    token = req.idempotency_token
+    if token is not None:
+        existing_run_id = _state["run_now_tokens"].get(token)
+        if existing_run_id is not None:
+            if existing_run_id not in _state["runs"]:
+                raise DatabricksError(
+                    error_code="NOT_FOUND",
+                    message=f"Run {existing_run_id} for idempotency token was deleted",
+                    status_code=404,
+                )
+            logger.info(f"Run-now with idempotency token reused run {existing_run_id}")
+            return RunNowResponse(run_id=existing_run_id, number_in_job=existing_run_id)
+
     if req.job_id not in _state["jobs"]:
         raise DatabricksError(
             error_code="NOT_FOUND",
@@ -631,6 +645,10 @@ async def run_now(req: RunNowRequest) -> RunNowResponse:
         "tasks": [],
         "_cancel_requested": False,
     }
+    if token is not None:
+        # There is no await between checking the token and recording the new run,
+        # so retries are serialized by the single-process event loop.
+        _state["run_now_tokens"][token] = run_id
 
     argv = _params_to_argv(
         static_list=None,
@@ -820,9 +838,18 @@ def get_state() -> Dict[str, Any]:
 
 
 def restore_state(data: Dict[str, Any]) -> None:
-    """Restore state from snapshot."""
+    """Restore state from snapshot, including registries keyed by numeric IDs.
+
+    JSON object keys are always strings. The live jobs state uses integer keys
+    for these registries, so normalize them before serving requests that look
+    up a job, run, or task output by its numeric ID.
+    """
     global _state
     _state.update(data)
+    for registry_name in ("jobs", "runs", "task_outputs"):
+        registry = _state.get(registry_name)
+        if registry is not None:
+            _state[registry_name] = {int(key): value for key, value in registry.items()}
 
 
 async def reset() -> None:
@@ -832,6 +859,7 @@ async def reset() -> None:
         "jobs": {},
         "runs": {},
         "submit_tokens": {},
+        "run_now_tokens": {},
         "next_job_id": 1,
         "next_run_id": 1,
     }

@@ -223,12 +223,15 @@ class DeleteJobRequest(BaseModel):
 
 class RunNowRequest(BaseModel):
     """Request body for POST /jobs/run-now. Parameter fields are flattened into
-    argv strings passed to the executed script (see services/jobs.py)."""
+    argv strings passed to the executed script (see services/jobs.py). An
+    idempotency token makes retries return the original run instead of starting
+    another one."""
 
     job_id: int
     notebook_params: Optional[Dict[str, str]] = None
     python_params: Optional[List[str]] = None
     job_parameters: Optional[Dict[str, str]] = None
+    idempotency_token: Optional[str] = Field(default=None, max_length=64)
 
     class Config:
         extra = "allow"
