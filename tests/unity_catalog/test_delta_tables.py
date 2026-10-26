@@ -13,8 +13,9 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import ColumnInfo, DataSourceFormat, TableType
-from deltalake import write_deltalake
+from deltalake import DeltaTable, write_deltalake
 
 
 @pytest.fixture
@@ -240,6 +241,62 @@ def test_insert_into_external_delta_table_with_explicit_columns(
     assert select.result.data_array == [[1, "Alice"], [2, "Bob"]]
 
     print(f"✓ Real INSERT with explicit column list worked: {table_name}")
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+@pytest.mark.parametrize(
+    "statement_template",
+    [
+        pytest.param("INSERT INTO {target} SELECT id FROM {source}", id="insert-select"),
+        pytest.param("DELETE FROM {target} WHERE id = 1", id="delete"),
+        pytest.param("UPDATE {target} SET id = 2 WHERE id = 1", id="update"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("catalog", "requested_schema"),
+    [
+        pytest.param("missing_catalog", "missing_schema", id="missing-catalog-and-schema"),
+        pytest.param("main", None, id="missing-catalog-matches-default-schema"),
+        pytest.param("", None, id="empty-catalog"),
+        pytest.param(None, "", id="empty-schema"),
+    ],
+)
+def test_external_delta_write_rejects_invalid_namespace(
+    delta_catalog_and_schema,
+    workspace_client: WorkspaceClient,
+    statement_template: str,
+    catalog: str,
+    requested_schema: str | None,
+):
+    """Invalid statement namespaces must not mutate an EXTERNAL Delta table."""
+    cat, schema = delta_catalog_and_schema
+    table_name = f"people_invalid_ns_{uuid4().hex[:6]}"
+    storage_location = _make_external_table(workspace_client, cat, schema, table_name, pd.DataFrame({"id": [1]}))
+    warehouse = workspace_client.warehouses.create(name=f"insert_invalid_ns_wh_{uuid4().hex[:6]}")
+    source_table = f"namespace_source_{uuid4().hex[:6]}"
+
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {source_table} AS SELECT 99::BIGINT AS id",
+    )
+    try:
+        with pytest.raises(DatabricksError):
+            workspace_client.statement_execution.execute_statement(
+                warehouse_id=warehouse.id,
+                statement=statement_template.format(
+                    target=f"{cat.name}.{schema.name}.{table_name}", source=source_table
+                ),
+                catalog=catalog,
+                schema=requested_schema,
+            )
+
+        assert DeltaTable(storage_location).to_pandas()["id"].tolist() == [1]
+    finally:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"DROP TABLE IF EXISTS {source_table}",
+        )
 
 
 @pytest.mark.serial

@@ -8,6 +8,7 @@ import uuid
 import pytest
 import requests
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import DataSourceFormat, TableType
 from databricks.sdk.service.sql import ColumnInfo, Disposition, Format
 
@@ -227,6 +228,119 @@ def test_execute_insert_and_select(warehouse_with_table, workspace_client):
     assert select_result.result.data_array[1] == [2, "two"]
 
     print("✓ INSERT and SELECT executed successfully")
+
+
+@pytest.mark.parametrize(
+    ("catalog", "schema"),
+    [
+        pytest.param("missing_namespace_catalog", "missing_schema", id="missing-catalog"),
+        pytest.param("namespace_valid_catalog", "missing_schema", id="missing-schema"),
+        pytest.param("main", None, id="missing-catalog-matches-default-schema"),
+        pytest.param("", None, id="empty-catalog"),
+        pytest.param(None, "", id="empty-schema"),
+        pytest.param("", "", id="both-empty"),
+    ],
+)
+@pytest.mark.parametrize(
+    "statement_template",
+    [
+        pytest.param("DELETE FROM {table}", id="delete"),
+        pytest.param("UPDATE {table} SET id = id + 1", id="update"),
+        pytest.param("INSERT INTO {table} VALUES (30)", id="insert"),
+    ],
+)
+@pytest.mark.workflow
+def test_invalid_namespace_rejects_statement_without_fallback(
+    workspace_client: WorkspaceClient,
+    catalog: str,
+    schema: str | None,
+    statement_template: str,
+):
+    """Invalid explicit catalog/schema must not run SQL in the connection's old namespace."""
+    warehouse = workspace_client.warehouses.create(name="invalid_namespace_wh")
+    if catalog == "namespace_valid_catalog":
+        workspace_client.catalogs.create(name=catalog)
+
+    table_name = f"namespace_guard_{uuid.uuid4().hex[:8]}"
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {table_name} AS SELECT 10 AS id UNION ALL SELECT 20",
+    )
+
+    try:
+        with pytest.raises(DatabricksError):
+            workspace_client.statement_execution.execute_statement(
+                warehouse_id=warehouse.id,
+                statement=statement_template.format(table=table_name),
+                catalog=catalog,
+                schema=schema,
+            )
+
+        result = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"SELECT id FROM {table_name} ORDER BY id",
+        )
+        assert result.result.data_array == [[10], [20]]
+    finally:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"DROP TABLE IF EXISTS {table_name}",
+        )
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_catalog_only_namespace_is_not_confused_with_same_named_schema(workspace_client: WorkspaceClient):
+    """A catalog-only context must select that catalog when its name is also a schema."""
+    warehouse = workspace_client.warehouses.create(name="namespace_collision_wh")
+    catalog = f"namespace_catalog_{uuid.uuid4().hex[:8]}"
+    table_name = f"namespace_collision_{uuid.uuid4().hex[:8]}"
+    workspace_client.catalogs.create(name=catalog)
+
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f'CREATE SCHEMA unity_catalog."{catalog}"',
+    )
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE unity_catalog.{catalog}.{table_name} AS SELECT 99 AS id",
+    )
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse.id,
+        statement=f"CREATE TABLE {catalog}.main.{table_name} AS SELECT 1 AS id",
+    )
+
+    try:
+        result = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"DELETE FROM {table_name}",
+            catalog=catalog,
+        )
+        assert result.result.data_array == [[1]]
+
+        intended_catalog = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"SELECT id FROM {catalog}.main.{table_name}",
+        )
+        same_named_schema = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"SELECT id FROM unity_catalog.{catalog}.{table_name}",
+        )
+        assert intended_catalog.result.data_array == []
+        assert same_named_schema.result.data_array == [[99]]
+    finally:
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"DROP TABLE IF EXISTS {catalog}.main.{table_name}",
+        )
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f"DROP TABLE IF EXISTS unity_catalog.{catalog}.{table_name}",
+        )
+        workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id,
+            statement=f'DROP SCHEMA IF EXISTS unity_catalog."{catalog}" CASCADE',
+        )
 
 
 @pytest.mark.crud
