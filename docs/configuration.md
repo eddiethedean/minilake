@@ -15,8 +15,20 @@ Everything is set through environment variables. Nothing needs a config file.
 | `MINILAKE_SERVICES` | (all) | Comma-separated allowlist, e.g. `unity_catalog,sql_statements,sql_warehouses` |
 | `MINILAKE_DUCKDB_MEMORY_LIMIT` | `4GB` | Declared but not yet applied to any connection — currently a no-op |
 | `MINILAKE_STATEMENT_CACHE_SIZE` | `500` | How many executed statements to keep. Backs both `GET /statements/{id}` and query history; the oldest lose their rows first, then their metadata |
+| `MINILAKE_SPARKLESS_SERVER_URL` | unset | Optional base URL of a native Sparkless Server. When set, SQL Statement Execution routes to the capability-checked Sparkless HTTP adapter instead of DuckDB |
+| `MINILAKE_SPARKLESS_REQUEST_TIMEOUT` | `35` | Outbound Sparkless HTTP timeout in seconds; set above the native response deadline to allow status recovery |
+| `MINILAKE_SPARKLESS_POST_ATTEMPTS` | `2` | Bounded SQL submission attempts. A mutation reuses the same operation ID and server instance on each attempt |
+| `MINILAKE_SPARKLESS_STATUS_POLLS` | `4` | Maximum retained-status reads after an ambiguous submission response |
+| `MINILAKE_SPARKLESS_STATUS_POLL_INTERVAL` | `0.1` | Delay in seconds between retained-status reads |
 | `MINILAKE_DEV_CORS` | unset | `1` allows cross-origin API access, for running the web UI's Next.js dev server on another port. Leave off otherwise — minilake has no authentication ([Web UI](ui.md#development)) |
 | `MINILAKE_DUCKDB_EXTENSION_DIR` | unset (`/opt/duckdb-extensions` in the image) | Directory of pre-installed DuckDB extensions. When set, the server only `LOAD`s the `delta` extension and never downloads it, which is what makes the image work with no internet access |
+
+The Sparkless backend is opt-in and supports only the native server's advertised SQL and
+scalar types. Catalog/schema defaults, SQL parameters, query tags, row/byte limits and
+asynchronous wait controls are rejected explicitly. To make a replay across separate
+MiniLake requests idempotent, callers can provide the optional `sparkless_operation_id`
+request field or `X-Sparkless-Operation-Id` header; the standard Databricks SDK does not
+currently expose that extension.
 
 ### Persistence
 

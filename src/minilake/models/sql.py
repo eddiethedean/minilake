@@ -97,7 +97,7 @@ class ExecuteStatementRequest(BaseModel):
     # The real API sends `schema`; without the alias that key was silently dropped and
     # the default namespace never applied. `populate_by_name` keeps `schema_name` working
     # for callers that already use it.
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     warehouse_id: str
     statement: str
@@ -105,6 +105,13 @@ class ExecuteStatementRequest(BaseModel):
     schema_name: Optional[str] = Field(None, alias="schema")
     disposition: Optional[str] = "INLINE"  # INLINE or EXTERNAL_LINKS
     format: Optional[str] = "JSON_ARRAY"  # JSON_ARRAY, ARROW, CSV
+    parameters: Optional[List[Dict[str, Any]]] = None
+    # Optional MiniLake extensions for callers that need to reuse one Sparkless
+    # mutation identity across requests. Supplying both values binds the retry to
+    # the server instance returned by the first response. The Databricks SDK does
+    # not send these fields.
+    sparkless_operation_id: Optional[str] = None
+    sparkless_server_instance_id: Optional[str] = None
 
 
 class StatementState(str, Enum):
@@ -144,6 +151,9 @@ class ColumnInfo(BaseModel):
     name: str
     type_text: Optional[str] = None
     type_name: Optional[str] = None
+    type_precision: Optional[int] = None
+    type_scale: Optional[int] = None
+    nullable: Optional[bool] = None
     position: Optional[int] = None
 
 
@@ -230,6 +240,10 @@ class ExecuteStatementResponse(BaseModel):
     created_at: Optional[int] = None
     started_at: Optional[int] = None
     ended_at: Optional[int] = None
+    server_instance_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    effect_outcome: Optional[str] = None
+    receipt: Optional[Dict[str, Any]] = None
 
     class Config:
         extra = "allow"
@@ -246,6 +260,10 @@ class GetStatementResponse(BaseModel):
     created_at: Optional[int] = None
     started_at: Optional[int] = None
     ended_at: Optional[int] = None
+    server_instance_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    effect_outcome: Optional[str] = None
+    receipt: Optional[Dict[str, Any]] = None
 
     class Config:
         extra = "allow"
