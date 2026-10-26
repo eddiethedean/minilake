@@ -6,7 +6,9 @@ tests is that submit reuses the *same* DAG scheduler `run-now` does: dependencie
 run must be visible to `runs/get` / `runs/list` like any other.
 """
 
+import asyncio
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 from databricks.sdk import WorkspaceClient
@@ -14,11 +16,14 @@ from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.jobs import (
     RunIf,
     SqlTask,
+    SqlTaskFile,
     SqlTaskQuery,
     SubmitTask,
     TaskDependency,
 )
 from databricks.sdk.service.sql import CreateQueryRequestQuery
+
+from minilake.services import jobs
 
 RUN_TIMEOUT = timedelta(minutes=5)
 
@@ -40,6 +45,16 @@ def _task(task_key: str, warehouse: str, query_id: str, **kwargs) -> SubmitTask:
         task_key=task_key,
         sql_task=SqlTask(warehouse_id=warehouse, query=SqlTaskQuery(query_id=query_id)),
         **kwargs,
+    )
+
+
+def _import_bytes(client: WorkspaceClient, path: str, content: bytes) -> None:
+    client.api_client.do(
+        "POST",
+        f"/api/2.0/workspace-files/import-file{path}",
+        query={"overwrite": "true"},
+        headers={"Content-Type": "application/octet-stream"},
+        data=content,
     )
 
 
@@ -132,6 +147,93 @@ def test_submit_rejects_invalid_dependency_graph(
     assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
     assert expected_message in str(exc.value).lower()
     assert list(workspace_client.jobs.list_runs()) == []
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_submit_sql_task_directory_fails_terminally(workspace_client: WorkspaceClient, warehouse: str):
+    path = f"/Shared/sql_task_dir_{uuid4().hex[:8]}"
+    workspace_client.workspace.mkdirs(path=path)
+
+    run = workspace_client.jobs.submit(
+        run_name="sql-directory",
+        tasks=[SubmitTask(task_key="directory", sql_task=SqlTask(warehouse_id=warehouse, file=SqlTaskFile(path=path)))],
+    ).result(timeout=RUN_TIMEOUT)
+
+    assert run.state.life_cycle_state.value == "TERMINATED"
+    assert run.state.result_state.value == "FAILED"
+    assert "not a file" in (run.tasks[0].state.state_message or "")
+    output = workspace_client.jobs.get_run_output(run_id=run.run_id)
+    assert "not a file" in (output.error or "")
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_submit_sql_task_invalid_utf8_fails_terminally(workspace_client: WorkspaceClient, warehouse: str):
+    path = f"/Shared/sql_task_invalid_utf8_{uuid4().hex[:8]}.sql"
+    _import_bytes(workspace_client, path, b"SELECT \xff")
+
+    run = workspace_client.jobs.submit(
+        run_name="sql-invalid-utf8",
+        tasks=[
+            SubmitTask(task_key="invalid-utf8", sql_task=SqlTask(warehouse_id=warehouse, file=SqlTaskFile(path=path)))
+        ],
+    ).result(timeout=RUN_TIMEOUT)
+
+    assert run.state.life_cycle_state.value == "TERMINATED"
+    assert run.state.result_state.value == "FAILED"
+    output = workspace_client.jobs.get_run_output(run_id=run.run_id)
+    assert "Unable to read workspace SQL file" in (output.error or "")
+    assert "codec can't decode" in (output.error or "")
+
+
+def test_run_executor_exception_marks_run_failed_with_diagnostics(monkeypatch):
+    run_id = 987654321
+    run = {
+        "run_id": run_id,
+        "job_id": None,
+        "state": {"life_cycle_state": "PENDING", "result_state": None, "state_message": None},
+        "_tasks": [{"task_key": "unexpected"}],
+    }
+    jobs._state["runs"][run_id] = run
+    sibling_started = asyncio.Event()
+    release_sibling = asyncio.Event()
+    sibling_finished = asyncio.Event()
+
+    async def fail_executor(task, argv):
+        if task.task_key == "unexpected":
+            await sibling_started.wait()
+            raise RuntimeError("executor exploded")
+        sibling_started.set()
+        try:
+            await release_sibling.wait()
+        finally:
+            sibling_finished.set()
+        return jobs.RunTaskInfo(task_key=task.task_key, state=jobs.RunState(life_cycle_state="TERMINATED"))
+
+    run["_tasks"].append({"task_key": "sibling"})
+
+    monkeypatch.setattr(jobs, "_execute_task", fail_executor)
+    try:
+
+        async def run_with_sibling():
+            running = asyncio.create_task(jobs._execute_run(run_id, []))
+            await asyncio.wait_for(sibling_started.wait(), timeout=1)
+            await asyncio.sleep(0.01)
+            assert not running.done()
+            assert run["state"]["life_cycle_state"] == "RUNNING"
+            release_sibling.set()
+            await running
+
+        asyncio.run(run_with_sibling())
+        assert sibling_finished.is_set()
+        assert run["state"]["life_cycle_state"] == "TERMINATED"
+        assert run["state"]["result_state"] == "FAILED"
+        assert "executor exploded" in run["state"]["state_message"]
+        assert "RuntimeError: executor exploded" in jobs._state["task_outputs"][run_id]["error"]
+    finally:
+        jobs._state["runs"].pop(run_id, None)
+        jobs._state.get("task_outputs", {}).pop(run_id, None)
 
 
 @pytest.mark.serial
