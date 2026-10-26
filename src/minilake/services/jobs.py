@@ -242,13 +242,13 @@ async def delete_job(req: DeleteJobRequest) -> dict:
 # ============================================================================
 
 
-def _resolve_sql_task_text(sql_task: SqlTask) -> str:
-    """Return the SQL a sql_task should run, from whichever source it names.
+def _resolve_sql_task(sql_task: SqlTask) -> tuple[str, Optional[str], Optional[str]]:
+    """Return the SQL and default namespace a sql_task should run, from its source.
 
     `file` reads a .sql file out of the workspace; `query` and `alert` read the
-    saved query's text straight out of the Queries API's own state, which is the
-    same object `w.queries.create()` writes. An alert runs the query it watches —
-    evaluating its condition is the caller's job (see `_evaluate_alert`).
+    saved query's execution context straight out of the Queries API's own state,
+    which is the same object `w.queries.create()` writes. An alert runs the query
+    it watches — evaluating its condition is the caller's job (see `_evaluate_alert`).
     """
     from minilake.services import alerts, saved_queries
 
@@ -263,10 +263,10 @@ def _resolve_sql_task_text(sql_task: SqlTask) -> str:
                 message=f"Workspace file '{sql_task.file.path}' not found",
                 status_code=404,
             )
-        return sql_path.read_text()
+        return sql_path.read_text(), None, None
 
     if sql_task.query is not None:
-        return saved_queries.resolve_query_text(sql_task.query.query_id)
+        return saved_queries.resolve_query_for_execution(sql_task.query.query_id)
 
     if sql_task.alert is not None:
         alert = alerts.get_alert_or_404(sql_task.alert.alert_id)
@@ -277,7 +277,7 @@ def _resolve_sql_task_text(sql_task: SqlTask) -> str:
                 message=f"Alert '{sql_task.alert.alert_id}' has no query_id",
                 status_code=400,
             )
-        return saved_queries.resolve_query_text(query_id)
+        return saved_queries.resolve_query_for_execution(query_id)
 
     raise DatabricksError(
         error_code="INVALID_PARAMETER_VALUE",
@@ -319,7 +319,7 @@ async def _execute_sql_task(task: Task, task_run_id: int, now_ms: int) -> RunTas
         return await _execute_alert_task(task, task_run_id, now_ms, warehouse_id)
 
     try:
-        sql_text = _resolve_sql_task_text(sql_task)
+        sql_text, catalog, schema_name = _resolve_sql_task(sql_task)
     except DatabricksError as e:
         return RunTaskInfo(
             task_key=task.task_key,
@@ -338,7 +338,7 @@ async def _execute_sql_task(task: Task, task_run_id: int, now_ms: int) -> RunTas
         sql_text = sql_text.replace(f"{{{{{key}}}}}", value)
 
     try:
-        columns, rows = await sql_statements._execute_sql_real(warehouse_id, sql_text)
+        columns, rows = await sql_statements._execute_sql_real(warehouse_id, sql_text, catalog, schema_name)
         _state["task_outputs"][task_run_id] = {
             "logs": f"columns={columns}\nrows={rows}",
             "error": None,

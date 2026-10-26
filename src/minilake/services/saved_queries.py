@@ -90,12 +90,13 @@ def _resolve_display_name(display_name: Optional[str], exclude_id: Optional[str]
     return f"{base} ({suffix})"
 
 
-def resolve_query_text(query_id: str) -> str:
-    """Return a saved query's SQL text, for callers that execute it.
+def resolve_query_for_execution(query_id: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Return a saved query's SQL text and its default catalog/schema.
 
     Exported for `jobs.sql_task.query`: a saved query is metadata here, but the
     text it stores is real SQL, and running it through the Statement Execution
-    path is what makes the task honest rather than SKIPPED.
+    path is what makes the task honest rather than SKIPPED. The namespace is part
+    of the query's execution context, just like it is for Statement Execution.
     """
     stored = _get_or_404(query_id)
     query_text = (stored.get("query_text") or "").strip()
@@ -105,7 +106,12 @@ def resolve_query_text(query_id: str) -> str:
             message=f"Query '{query_id}' has no query_text to run",
             status_code=400,
         )
-    return query_text
+    return query_text, stored.get("catalog"), stored.get("schema")
+
+
+def resolve_query_text(query_id: str) -> str:
+    """Return a saved query's SQL text, for callers that do not need its context."""
+    return resolve_query_for_execution(query_id)[0]
 
 
 @router.post("/queries", response_model=Query)

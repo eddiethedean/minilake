@@ -156,8 +156,8 @@ async def evaluate_alert(alert_id: str, warehouse_id: str) -> AlertEvaluation:
             status_code=400,
         )
 
-    sql_text = saved_queries.resolve_query_text(query_id)
-    column_names, rows = await sql_statements._execute_sql_real(warehouse_id, sql_text)
+    sql_text, catalog, schema_name = saved_queries.resolve_query_for_execution(query_id)
+    column_names, rows = await sql_statements._execute_sql_real(warehouse_id, sql_text, catalog, schema_name)
 
     condition = stored.get("condition") or {}
     empty_state = condition.get("empty_result_state") or STATE_UNKNOWN

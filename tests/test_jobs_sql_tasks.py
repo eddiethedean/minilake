@@ -55,6 +55,41 @@ def seeded_query(workspace_client: WorkspaceClient, warehouse: str) -> str:
     ).id
 
 
+@pytest.fixture
+def namespaced_query(workspace_client: WorkspaceClient, warehouse: str) -> str:
+    """A saved query whose unqualified table conflicts with the default namespace."""
+    suffix = uuid4().hex[:8]
+    table = f"task_namespace_rows_{suffix}"
+    catalog = f"task_catalog_{suffix}"
+    schema = f"task_schema_{suffix}"
+
+    workspace_client.catalogs.create(name=catalog)
+    workspace_client.schemas.create(name=schema, catalog_name=catalog)
+
+    # The unqualified table deliberately returns a different value from the table
+    # in the saved query's namespace. A lost namespace therefore remains visible.
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse,
+        statement=f"CREATE TABLE {table} AS SELECT 1 AS n",
+    )
+    workspace_client.statement_execution.execute_statement(
+        warehouse_id=warehouse,
+        statement=f"CREATE TABLE {table} AS SELECT 42 AS n",
+        catalog=catalog,
+        schema=schema,
+    )
+
+    return workspace_client.queries.create(
+        query=CreateQueryRequestQuery(
+            display_name="namespaced task query",
+            query_text=f"SELECT n FROM {table}",
+            catalog=catalog,
+            schema=schema,
+            warehouse_id=warehouse,
+        )
+    ).id
+
+
 def _alert(
     workspace_client: WorkspaceClient,
     query_id: str,
@@ -103,6 +138,28 @@ def test_sql_task_query_executes_the_saved_query(workspace_client: WorkspaceClie
     assert "[[3]]" in (output.logs or "")
 
 
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_sql_task_query_uses_saved_query_namespace(
+    workspace_client: WorkspaceClient, warehouse: str, namespaced_query: str
+):
+    """An unqualified saved query reads from its saved catalog and schema."""
+    job = workspace_client.jobs.create(
+        name="sql-task-query-namespace",
+        tasks=[
+            Task(
+                task_key="read-namespaced-table",
+                sql_task=SqlTask(warehouse_id=warehouse, query=SqlTaskQuery(query_id=namespaced_query)),
+            )
+        ],
+    )
+
+    run = workspace_client.jobs.run_now(job_id=job.job_id).result(timeout=RUN_TIMEOUT)
+    assert run.state.result_state.value == "SUCCESS"
+    output = workspace_client.jobs.get_run_output(run_id=run.tasks[0].run_id)
+    assert "[[42]]" in (output.logs or "")
+
+
 @pytest.mark.error
 def test_sql_task_query_with_unknown_query_id_fails(workspace_client: WorkspaceClient, warehouse: str):
     """A missing saved query fails the task loudly rather than skipping it."""
@@ -143,6 +200,30 @@ def test_sql_task_alert_triggers_on_real_data(workspace_client: WorkspaceClient,
     run = workspace_client.jobs.run_now(job_id=job.job_id).result(timeout=RUN_TIMEOUT)
 
     # A fired alert is a successful task, not a failed one.
+    assert run.state.result_state.value == "SUCCESS"
+    assert run.tasks[0].state.state_message == "Alert TRIGGERED"
+    assert workspace_client.alerts.get(id=alert_id).state.value == "TRIGGERED"
+
+
+@pytest.mark.serial
+@pytest.mark.workflow
+def test_sql_task_alert_uses_saved_query_namespace(
+    workspace_client: WorkspaceClient, warehouse: str, namespaced_query: str
+):
+    """Alert evaluation uses the saved query namespace when resolving table names."""
+    alert_id = _alert(workspace_client, namespaced_query, "namespaced-over", ComparisonOperator.GREATER_THAN, 10)
+
+    job = workspace_client.jobs.create(
+        name="alert-query-namespace",
+        tasks=[
+            Task(
+                task_key="check-namespaced-table",
+                sql_task=SqlTask(warehouse_id=warehouse, alert=SqlTaskAlert(alert_id=alert_id)),
+            )
+        ],
+    )
+
+    run = workspace_client.jobs.run_now(job_id=job.job_id).result(timeout=RUN_TIMEOUT)
     assert run.state.result_state.value == "SUCCESS"
     assert run.tasks[0].state.state_message == "Alert TRIGGERED"
     assert workspace_client.alerts.get(id=alert_id).state.value == "TRIGGERED"
