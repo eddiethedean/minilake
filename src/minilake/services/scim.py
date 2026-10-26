@@ -19,6 +19,7 @@ The current user from `identity.py` is seeded into the Users store at reset, so
 import logging
 import re
 import uuid
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter
@@ -229,13 +230,14 @@ _PATH_FILTER_RE = re.compile(r'^(?P<attr>\w+)\[\s*(?P<key>\w+)\s+eq\s+"?(?P<valu
 
 
 def _apply_patch(stored: Dict[str, Any], req: PatchRequest, resource: str) -> Dict[str, Any]:
-    """Apply a SCIM PATCH body.
+    """Build a validated PATCH result without mutating the stored resource.
 
     Supports the operations clients actually send: `replace` on a named attribute or
     on a whole object, and `add`/`remove` on a multi-valued attribute (group members,
     entitlements, roles) — including the `members[value eq "id"]` path form used to
     remove a single member.
     """
+    candidate = deepcopy(stored)
     operations = req.operations or []
     if not operations:
         raise DatabricksError(
@@ -261,11 +263,11 @@ def _apply_patch(stored: Dict[str, Any], req: PatchRequest, resource: str) -> Di
         if path_filter:
             attr = path_filter.group("attr")
             key, wanted = path_filter.group("key"), path_filter.group("value")
-            current = list(stored.get(attr) or [])
+            current = list(candidate.get(attr) or [])
             if op == "remove":
-                stored[attr] = [e for e in current if str(e.get(key)) != wanted]
+                candidate[attr] = [e for e in current if str(e.get(key)) != wanted]
             else:
-                stored[attr] = current + _as_list(value)
+                candidate[attr] = current + _as_list(value)
             continue
 
         if path is None:
@@ -278,20 +280,27 @@ def _apply_patch(stored: Dict[str, Any], req: PatchRequest, resource: str) -> Di
                 )
             if op == "remove":
                 for key in value:
-                    stored.pop(key, None)
+                    candidate.pop(key, None)
             else:
-                stored.update(value)
+                candidate.update(value)
             continue
 
         if op == "remove":
-            stored.pop(path, None)
-        elif op == "add" and isinstance(stored.get(path), list):
-            stored[path] = list(stored[path]) + _as_list(value)
+            candidate.pop(path, None)
+        elif op == "add" and isinstance(candidate.get(path), list):
+            candidate[path] = list(candidate[path]) + _as_list(value)
         else:
-            stored[path] = value
+            candidate[path] = value
 
-    _unique_check(resource, stored.get(_config(resource)[2]), exclude_id=stored.get("id"))
-    return _prune_empty(stored)
+    _unique_check(resource, candidate.get(_config(resource)[2]), exclude_id=stored.get("id"))
+    return _prune_empty(candidate)
+
+
+def _patch_resource(resource: str, resource_id: str, req: PatchRequest) -> Dict[str, Any]:
+    """Commit a PATCH result only after all operations and uniqueness checks pass."""
+    candidate = _apply_patch(_get_or_404(resource, resource_id), req, resource)
+    _state[resource][resource_id] = candidate
+    return candidate
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -341,7 +350,7 @@ async def update_user(user_id: str, user: User) -> Dict[str, Any]:
 @router.patch("/Users/{user_id}", response_model=None)
 async def patch_user(user_id: str, req: PatchRequest) -> Dict[str, Any]:
     """Patch a user."""
-    return _apply_patch(_get_or_404("Users", user_id), req, "Users")
+    return _patch_resource("Users", user_id, req)
 
 
 @router.delete("/Users/{user_id}")
@@ -391,7 +400,7 @@ async def update_group(group_id: str, group: Group) -> Dict[str, Any]:
 @router.patch("/Groups/{group_id}", response_model=None)
 async def patch_group(group_id: str, req: PatchRequest) -> Dict[str, Any]:
     """Patch a group — this is how members are added and removed."""
-    return _apply_patch(_get_or_404("Groups", group_id), req, "Groups")
+    return _patch_resource("Groups", group_id, req)
 
 
 @router.delete("/Groups/{group_id}")
@@ -450,7 +459,7 @@ async def update_service_principal(sp_id: str, sp: ServicePrincipal) -> Dict[str
 @router.patch("/ServicePrincipals/{sp_id}", response_model=None)
 async def patch_service_principal(sp_id: str, req: PatchRequest) -> Dict[str, Any]:
     """Patch a service principal."""
-    return _apply_patch(_get_or_404("ServicePrincipals", sp_id), req, "ServicePrincipals")
+    return _patch_resource("ServicePrincipals", sp_id, req)
 
 
 @router.delete("/ServicePrincipals/{sp_id}")

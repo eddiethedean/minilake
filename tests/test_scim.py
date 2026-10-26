@@ -12,6 +12,33 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.iam import ComplexValue, Patch, PatchOp
 
+_PATCH_ATOMICITY_CASES = [
+    (
+        "users",
+        "user_name",
+        "userName",
+        "display_name",
+        "displayName",
+        "alice@example.com",
+        "bob@example.com",
+    ),
+    ("groups", "display_name", "displayName", "external_id", "externalId", "engineering", "product"),
+    (
+        "service_principals",
+        "application_id",
+        "applicationId",
+        "display_name",
+        "displayName",
+        "11111111-2222-3333-4444-555555555555",
+        "66666666-7777-8888-9999-000000000000",
+    ),
+]
+
+
+def _create_patch_test_resource(client, unique_attr, unique_value, stable_attr):
+    return client.create(**{unique_attr: unique_value, stable_attr: "Original metadata"})
+
+
 # --------------------------------------------------------------------------- users
 
 
@@ -88,6 +115,70 @@ def test_duplicate_user_name_rejected(workspace_client: WorkspaceClient):
     with pytest.raises(DatabricksError) as exc:
         workspace_client.users.create(user_name="dupe@example.com")
     assert "already exists" in str(exc.value).lower()
+
+
+@pytest.mark.error
+@pytest.mark.parametrize(
+    "resource_name,unique_attr,unique_path,stable_attr,stable_path,first_value,target_value",
+    _PATCH_ATOMICITY_CASES,
+)
+def test_duplicate_scim_patch_preserves_resource(
+    workspace_client: WorkspaceClient,
+    resource_name: str,
+    unique_attr: str,
+    unique_path: str,
+    stable_attr: str,
+    stable_path: str,
+    first_value: str,
+    target_value: str,
+):
+    resource = getattr(workspace_client, resource_name)
+    resource.create(**{unique_attr: first_value, stable_attr: "Existing resource"})
+    target = _create_patch_test_resource(resource, unique_attr, target_value, stable_attr)
+
+    with pytest.raises(DatabricksError):
+        resource.patch(
+            id=target.id,
+            operations=[Patch(op=PatchOp.REPLACE, path=unique_path, value=first_value)],
+        )
+
+    fetched = resource.get(id=target.id)
+    assert getattr(fetched, unique_attr) == target_value
+    assert getattr(fetched, stable_attr) == "Original metadata"
+    assert len(list(resource.list(filter=f'{unique_path} eq "{first_value}"'))) == 1
+
+
+@pytest.mark.error
+@pytest.mark.parametrize(
+    "resource_name,unique_attr,unique_path,stable_attr,stable_path,first_value,target_value",
+    _PATCH_ATOMICITY_CASES,
+)
+def test_rejected_multi_operation_scim_patch_does_not_commit_prior_operations(
+    workspace_client: WorkspaceClient,
+    resource_name: str,
+    unique_attr: str,
+    unique_path: str,
+    stable_attr: str,
+    stable_path: str,
+    first_value: str,
+    target_value: str,
+):
+    resource = getattr(workspace_client, resource_name)
+    resource.create(**{unique_attr: first_value, stable_attr: "Existing resource"})
+    target = _create_patch_test_resource(resource, unique_attr, target_value, stable_attr)
+
+    with pytest.raises(DatabricksError):
+        resource.patch(
+            id=target.id,
+            operations=[
+                Patch(op=PatchOp.REPLACE, path=stable_path, value="Must not be saved"),
+                Patch(op=PatchOp.REPLACE, path=unique_path, value=first_value),
+            ],
+        )
+
+    fetched = resource.get(id=target.id)
+    assert getattr(fetched, unique_attr) == target_value
+    assert getattr(fetched, stable_attr) == "Original metadata"
 
 
 @pytest.mark.error
