@@ -3,6 +3,8 @@ as source of truth (databricks-sdk's Wait helper actually polls GET /get
 until RUNNING/TERMINATED, exercising real polling logic against minilake's
 timed state transitions, not an instant canned response)."""
 
+import os
+import time
 from uuid import uuid4
 
 import pytest
@@ -28,6 +30,27 @@ def test_cluster_create_reaches_running(workspace_client: WorkspaceClient):
     assert cluster.state == State.RUNNING
     assert cluster.cluster_id
     print(f"✓ Cluster reached RUNNING for real: {cluster.cluster_id}")
+
+
+@pytest.mark.crud
+def test_terminating_cluster_cancels_pending_start(workspace_client: WorkspaceClient):
+    """A create transition must not undo a later termination request."""
+    created = workspace_client.clusters.create(
+        spark_version=_spark_version(),
+        node_type_id="Standard_DS3_v2",
+        num_workers=1,
+        cluster_name=f"cluster_{uuid4().hex[:6]}",
+    )
+    cluster_id = created.response.cluster_id
+
+    workspace_client.clusters.delete(cluster_id=cluster_id)
+
+    start_delay = float(os.getenv("MINILAKE_CLUSTER_START_DELAY", "1"))
+    terminate_delay = float(os.getenv("MINILAKE_CLUSTER_TERMINATE_DELAY", "0.5"))
+    time.sleep(max(start_delay, terminate_delay) + 0.5)
+
+    cluster = workspace_client.clusters.get(cluster_id=cluster_id)
+    assert cluster.state == State.TERMINATED
 
 
 @pytest.mark.crud

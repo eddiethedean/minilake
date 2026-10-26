@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/2.1/clusters", tags=["clusters"])
 
 _state: Dict[str, Any] = {"clusters": {}}
+_transition_tokens: Dict[str, str] = {}
 
 
 def _validate_references(policy_id: Any, instance_pool_id: Any) -> None:
@@ -81,9 +82,19 @@ def _get_or_404(cluster_id: str) -> dict:
     return cluster
 
 
-async def _transition(cluster_id: str, delay_seconds: float, target_state: str) -> None:
-    """Background transition: flips a cluster's state after a real delay."""
+def _schedule_transition(cluster_id: str, delay_seconds: float, target_state: str) -> None:
+    """Schedule a transition that supersedes any earlier operation for the cluster."""
+    token = str(uuid.uuid4())
+    _transition_tokens[cluster_id] = token
+    asyncio.create_task(_transition(cluster_id, token, delay_seconds, target_state))
+
+
+async def _transition(cluster_id: str, token: str, delay_seconds: float, target_state: str) -> None:
+    """Apply a delayed transition only if no newer lifecycle operation replaced it."""
     await asyncio.sleep(delay_seconds)
+    if _transition_tokens.get(cluster_id) != token:
+        return
+    _transition_tokens.pop(cluster_id, None)
     cluster = _state["clusters"].get(cluster_id)
     if cluster is None:
         return
@@ -131,7 +142,7 @@ async def create_cluster(req: CreateClusterRequest) -> CreateClusterResponse:
         "default_tags": {},
     }
     _state["clusters"][cluster_id] = cluster
-    asyncio.create_task(_transition(cluster_id, settings.cluster_start_delay_seconds, "RUNNING"))
+    _schedule_transition(cluster_id, settings.cluster_start_delay_seconds, "RUNNING")
     logger.info(f"Created cluster: {cluster_id} ({req.cluster_name})")
     return CreateClusterResponse(cluster_id=cluster_id)
 
@@ -242,7 +253,7 @@ async def start_cluster(req: ClusterIdRequest) -> ClusterInfo:
     cluster["state"] = "PENDING"
     cluster["state_message"] = "Starting cluster"
     cluster["terminated_time"] = None
-    asyncio.create_task(_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING"))
+    _schedule_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING")
     return _to_info(cluster)
 
 
@@ -254,7 +265,7 @@ async def terminate_cluster(req: ClusterIdRequest) -> ClusterInfo:
         return _to_info(cluster)
     cluster["state"] = "TERMINATING"
     cluster["state_message"] = "Terminating cluster"
-    asyncio.create_task(_transition(req.cluster_id, settings.cluster_terminate_delay_seconds, "TERMINATED"))
+    _schedule_transition(req.cluster_id, settings.cluster_terminate_delay_seconds, "TERMINATED")
     return _to_info(cluster)
 
 
@@ -263,6 +274,7 @@ async def permanent_delete_cluster(req: ClusterIdRequest) -> dict:
     """Permanently remove a cluster's record (unlike /delete, no history kept)."""
     _get_or_404(req.cluster_id)
     del _state["clusters"][req.cluster_id]
+    _transition_tokens.pop(req.cluster_id, None)
     return {}
 
 
@@ -273,7 +285,7 @@ async def restart_cluster(req: RestartClusterRequest) -> ClusterInfo:
     cluster["state"] = "RESTARTING"
     cluster["state_message"] = "Restarting cluster"
     cluster["last_restarted_time"] = int(time.time() * 1000)
-    asyncio.create_task(_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING"))
+    _schedule_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING")
     return _to_info(cluster)
 
 
@@ -287,7 +299,7 @@ async def resize_cluster(req: ResizeClusterRequest) -> ClusterInfo:
         cluster["autoscale"] = req.autoscale
     cluster["state"] = "RESIZING"
     cluster["state_message"] = "Resizing cluster"
-    asyncio.create_task(_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING"))
+    _schedule_transition(req.cluster_id, settings.cluster_start_delay_seconds, "RUNNING")
     return _to_info(cluster)
 
 
@@ -375,3 +387,4 @@ def restore_state(data: Dict[str, Any]) -> None:
 async def reset() -> None:
     global _state
     _state = {"clusters": {}}
+    _transition_tokens.clear()
