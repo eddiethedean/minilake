@@ -104,6 +104,36 @@ def test_submit_honours_task_dependencies(workspace_client: WorkspaceClient, war
     assert by_key["never"].state.life_cycle_state.value == "SKIPPED"
 
 
+@pytest.mark.error
+@pytest.mark.parametrize("graph", ["unknown_dependency", "cycle"])
+def test_submit_rejects_invalid_dependency_graph(
+    workspace_client: WorkspaceClient, warehouse: str, query_id: str, graph: str
+):
+    if graph == "unknown_dependency":
+        tasks = [
+            _task(
+                "dependent",
+                warehouse,
+                query_id,
+                depends_on=[TaskDependency(task_key="missing")],
+            )
+        ]
+        expected_message = "unknown task"
+    else:
+        tasks = [
+            _task("first", warehouse, query_id, depends_on=[TaskDependency(task_key="second")]),
+            _task("second", warehouse, query_id, depends_on=[TaskDependency(task_key="first")]),
+        ]
+        expected_message = "cycle"
+
+    with pytest.raises(DatabricksError) as exc:
+        workspace_client.jobs.submit(run_name=f"invalid-{graph}", tasks=tasks)
+
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+    assert expected_message in str(exc.value).lower()
+    assert list(workspace_client.jobs.list_runs()) == []
+
+
 @pytest.mark.serial
 def test_submit_idempotency_token_reuses_the_run(workspace_client: WorkspaceClient, warehouse: str, query_id: str):
     """Re-submitting with the same token returns the original run, not a second one."""

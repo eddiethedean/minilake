@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query, Request
@@ -103,6 +104,50 @@ def _params_to_argv(
     return argv
 
 
+def _task_graph_error(tasks: List[Task]) -> Optional[str]:
+    """Return a validation error for a task graph that cannot be scheduled."""
+    task_keys = set()
+    for task in tasks:
+        if task.task_key in task_keys:
+            return f"Task key '{task.task_key}' is not unique."
+        task_keys.add(task.task_key)
+
+    dependencies_by_key: Dict[str, set] = {}
+    dependents_by_key: Dict[str, List[str]] = defaultdict(list)
+    for task in tasks:
+        dependencies = {dependency.task_key for dependency in (task.depends_on or [])}
+        for dependency_key in dependencies:
+            if dependency_key not in task_keys:
+                return f"Task '{task.task_key}' depends on unknown task '{dependency_key}'."
+            dependents_by_key[dependency_key].append(task.task_key)
+        dependencies_by_key[task.task_key] = dependencies
+
+    ready = deque(task_key for task_key, dependencies in dependencies_by_key.items() if not dependencies)
+    visited = 0
+    while ready:
+        task_key = ready.popleft()
+        visited += 1
+        for dependent_key in dependents_by_key[task_key]:
+            dependencies = dependencies_by_key[dependent_key]
+            dependencies.remove(task_key)
+            if not dependencies:
+                ready.append(dependent_key)
+
+    if visited != len(tasks):
+        return "Task dependencies contain a cycle."
+    return None
+
+
+def _validate_task_graph(tasks: List[Task]) -> None:
+    error = _task_graph_error(tasks)
+    if error:
+        raise DatabricksError(error_code="INVALID_PARAMETER_VALUE", message=error, status_code=400)
+
+
+def _tasks_from_settings(settings: Dict[str, Any]) -> List[Task]:
+    return [Task(**task) for task in (settings.get("tasks") or [])]
+
+
 # ============================================================================
 # Jobs CRUD
 # ============================================================================
@@ -111,6 +156,7 @@ def _params_to_argv(
 @router.post("/create", response_model=CreateJobResponse)
 async def create_job(req: CreateJobRequest) -> CreateJobResponse:
     """Create a new job."""
+    _validate_task_graph(req.tasks or [])
     job_id = _next_job_id()
     now_ms = int(time.time() * 1000)
     _state["jobs"][job_id] = {
@@ -152,10 +198,13 @@ async def update_job(req: UpdateJobRequest) -> dict:
             status_code=404,
         )
     job = _state["jobs"][req.job_id]
+    new_settings = dict(job["settings"])
     if req.new_settings is not None:
-        job["settings"].update(req.new_settings.model_dump(exclude_none=True))
+        new_settings.update(req.new_settings.model_dump(exclude_none=True))
     for field in req.fields_to_remove or []:
-        job["settings"].pop(field, None)
+        new_settings.pop(field, None)
+    _validate_task_graph(_tasks_from_settings(new_settings))
+    job["settings"] = new_settings
     return {}
 
 
@@ -168,7 +217,9 @@ async def reset_job(req: ResetJobRequest) -> dict:
             message=f"Job {req.job_id} not found",
             status_code=404,
         )
-    _state["jobs"][req.job_id]["settings"] = req.new_settings.model_dump(exclude_none=True)
+    new_settings = req.new_settings.model_dump(exclude_none=True)
+    _validate_task_graph(_tasks_from_settings(new_settings))
+    _state["jobs"][req.job_id]["settings"] = new_settings
     return {}
 
 
@@ -547,8 +598,27 @@ async def _execute_run(run_id: int, argv: List[str]) -> None:
     if task_source is None:
         task_source = (job["settings"].get("tasks") if job else []) or []
     tasks = [Task(**t) for t in task_source]
+    graph_error = _task_graph_error(tasks)
+    if graph_error:
+        end_ms = int(time.time() * 1000)
+        run["tasks"] = [
+            RunTaskInfo(
+                task_key=task.task_key,
+                state=RunState(life_cycle_state="SKIPPED", state_message=graph_error),
+            ).model_dump(exclude_none=True)
+            for task in tasks
+        ]
+        run["end_time"] = end_ms
+        run["state"] = {
+            "life_cycle_state": "TERMINATED",
+            "result_state": RunResultState.FAILED.value,
+            "state_message": graph_error,
+        }
+        logger.warning("Run %s rejected an invalid task graph: %s", run_id, graph_error)
+        return
+
     task_by_key = {t.task_key: t for t in tasks}
-    deps_by_key = {t.task_key: [d.task_key for d in (t.depends_on or []) if d.task_key in task_by_key] for t in tasks}
+    deps_by_key = {t.task_key: [d.task_key for d in (t.depends_on or [])] for t in tasks}
 
     results: Dict[str, RunTaskInfo] = {}
 
@@ -567,11 +637,12 @@ async def _execute_run(run_id: int, argv: List[str]) -> None:
             results[task_key] = await _execute_task(task, argv)
 
     pending = set(task_by_key.keys())
+    unschedulable = False
     while pending:
         ready = [k for k in pending if all(d in results for d in deps_by_key[k])]
         if not ready:
-            # depends_on references a nonexistent task_key or forms a cycle —
-            # can't schedule the rest; SKIP them rather than hang forever.
+            # Defensive fallback in case the graph changes after validation.
+            unschedulable = True
             for k in pending:
                 results[k] = RunTaskInfo(
                     task_key=k,
@@ -595,7 +666,7 @@ async def _execute_run(run_id: int, argv: List[str]) -> None:
             "result_state": RunResultState.CANCELED.value,
             "state_message": "Run canceled",
         }
-    elif any_failed:
+    elif any_failed or unschedulable:
         run["state"] = {
             "life_cycle_state": "TERMINATED",
             "result_state": RunResultState.FAILED.value,
@@ -632,6 +703,8 @@ async def run_now(req: RunNowRequest) -> RunNowResponse:
             message=f"Job {req.job_id} not found",
             status_code=404,
         )
+
+    _validate_task_graph(_tasks_from_settings(_state["jobs"][req.job_id]["settings"]))
 
     run_id = _next_run_id()
     now_ms = int(time.time() * 1000)
@@ -683,6 +756,8 @@ async def submit_run(req: SubmitRunRequest) -> SubmitRunResponse:
         if existing is not None:
             logger.info(f"Submit with idempotency_token '{token}' reused run {existing}")
             return SubmitRunResponse(run_id=existing)
+
+    _validate_task_graph(req.tasks)
 
     run_id = _next_run_id()
     now_ms = int(time.time() * 1000)
