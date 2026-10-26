@@ -1006,4 +1006,3 @@ def test_external_links_arrow_stream_preserves_typed_null_and_empty_columns(
     table = pa.ipc.open_stream(response.content).read_all()
     assert table.schema.field("value").type == pa.int32()
     assert table.column("value").to_pylist() == expected_rows
-
