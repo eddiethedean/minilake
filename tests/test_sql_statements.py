@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import os
 import uuid
 
 import pytest
@@ -611,6 +612,30 @@ def test_external_links_json_array_real_fetch(workspace_client: WorkspaceClient)
     assert rows == [[1, "Alice"], [2, "Bob"]]
 
     print(f"✓ EXTERNAL_LINKS JSON_ARRAY real fetch returned real data: {link.external_link}")
+
+
+@pytest.mark.workflow
+def test_statement_cache_overflow_preserves_newest_external_result(workspace_client: WorkspaceClient):
+    """Crossing the statement cache limit must not erase the newest result."""
+    wh = workspace_client.warehouses.create(name="statement_cache_overflow_wh")
+    cache_limit = max(1, int(os.getenv("MINILAKE_STATEMENT_CACHE_SIZE", "500")))
+    verify_at = {cache_limit - 1, cache_limit, cache_limit + 1}
+
+    for value in range(cache_limit + 2):
+        result = workspace_client.statement_execution.execute_statement(
+            warehouse_id=wh.id,
+            statement=f"SELECT {value} AS n",
+            disposition=Disposition.EXTERNAL_LINKS,
+            format=Format.JSON_ARRAY,
+        )
+
+        if value in verify_at:
+            assert result.result.external_links is not None
+            link = result.result.external_links[0]
+            assert link.row_count == 1
+            response = requests.get(link.external_link)
+            assert response.status_code == 200
+            assert json.loads(response.text) == [[value]]
 
 
 @pytest.mark.workflow

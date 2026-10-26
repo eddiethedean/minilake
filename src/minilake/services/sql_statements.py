@@ -84,31 +84,11 @@ _QUERY_STATUS_BY_STATE = {
 
 
 def _record_statement(entry: Dict[str, Any]) -> None:
-    """Store an executed statement, evicting the oldest once over the cap.
-
-    Rows go first and metadata second: a statement whose rows were dropped can no
-    longer serve `/result`, but it still belongs in query history, which is the far
-    cheaper thing to keep.
-    """
+    """Store an executed statement, evicting the oldest entries over the cap."""
     statements: Dict[str, Any] = _state["statements"]
     statements[entry["id"]] = entry
 
     limit = max(1, settings.statement_cache_size)
-    if len(statements) <= limit:
-        return
-
-    for statement_id in list(statements.keys()):
-        if len(statements) <= limit:
-            break
-        stale = statements[statement_id]
-        if stale.get("raw_rows") or stale.get("result"):
-            stale["raw_rows"] = []
-            stale["result"] = None
-            stale["rows_evicted"] = True
-        else:
-            del statements[statement_id]
-
-    # Everything left is already metadata-only; drop oldest-first until under the cap.
     while len(statements) > limit:
         del statements[next(iter(statements))]
 
