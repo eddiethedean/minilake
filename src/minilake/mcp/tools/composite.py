@@ -5,11 +5,14 @@ round-trip sequence that would otherwise cost the model many turns and a lot of 
 """
 
 from typing import Any
+from uuid import uuid4
 
 from mcp.server.fastmcp.exceptions import ToolError
 
+from minilake.errors import DatabricksError
 from minilake.mcp.client import MinilakeClient
 from minilake.mcp.tools.sql import ensure_warehouse
+from minilake.uc_types import validate_identifier
 
 _UC = "/api/2.1/unity-catalog"
 _SQL = "/api/2.0/sql"
@@ -88,6 +91,19 @@ def register(mcp: Any, client: MinilakeClient) -> None:
         await _ensure_schema(client, catalog, schema)
 
         if recreate:
+            # The staging table has a generated, valid name, so its creation cannot
+            # validate the requested target name. Validate that name before dropping
+            # the existing table; SQL-created tables can have names UC rejects.
+            try:
+                validate_identifier(table, "table")
+            except DatabricksError as e:
+                raise ToolError(f"{e.error_code}: {e.message}") from e
+
+            # Validate both the replacement schema and every value before dropping the
+            # current table. Creating/populating a separate managed table exercises the
+            # same UC type validation and DuckDB conversions without risking user data.
+            await _validate_seed_replacement(client, warehouse_id, catalog, schema, columns, rows)
+
             # Drop the physical table too: deleting only the UC metadata would leave the
             # DuckDB table (with its old column list) in place.
             await _run_sql(client, warehouse_id, f"DROP TABLE IF EXISTS {quoted}")
@@ -115,11 +131,12 @@ def register(mcp: Any, client: MinilakeClient) -> None:
             if "already exists" not in str(e).lower():
                 raise
 
-        await _run_sql(client, warehouse_id, f"DELETE FROM {quoted}")
-
+        statements = ["BEGIN TRANSACTION", f"DELETE FROM {quoted}"]
         if rows:
             values = ", ".join(f"({', '.join(_literal(v) for v in row)})" for row in rows)
-            await _run_sql(client, warehouse_id, f"INSERT INTO {quoted} VALUES {values}")
+            statements.append(f"INSERT INTO {quoted} VALUES {values}")
+        statements.append("COMMIT")
+        await _run_sql(client, warehouse_id, "; ".join(statements))
 
         return {"full_name": full_name, "rows_inserted": len(rows)}
 
@@ -150,6 +167,46 @@ def register(mcp: Any, client: MinilakeClient) -> None:
 async def _run_sql(client: MinilakeClient, warehouse_id: str, statement: str) -> dict[str, Any]:
     """Execute a statement through minilake's SQL endpoint."""
     return await client.post(f"{_SQL}/statements", json={"statement": statement, "warehouse_id": warehouse_id})
+
+
+async def _validate_seed_replacement(
+    client: MinilakeClient,
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+    columns: list[dict[str, str]],
+    rows: list[list[Any]],
+) -> None:
+    """Validate replacement columns and rows in a disposable managed table."""
+    stage_name = f"_minilake_seed_validation_{uuid4().hex}"
+    stage_full_name = f"{catalog}.{schema}.{stage_name}"
+    quoted_stage = f'"{catalog}"."{schema}"."{stage_name}"'
+
+    try:
+        await client.post(
+            f"{_UC}/tables",
+            json={
+                "name": stage_name,
+                "catalog_name": catalog,
+                "schema_name": schema,
+                "columns": columns,
+                "table_type": "MANAGED",
+            },
+        )
+        if rows:
+            values = ", ".join(f"({', '.join(_literal(value) for value in row)})" for row in rows)
+            await _run_sql(client, warehouse_id, f"INSERT INTO {quoted_stage} VALUES {values}")
+    except BaseException:
+        # Preserve the validation error while making a best effort to remove any
+        # partially-created staging table. The target has not been touched yet.
+        try:
+            await client.delete(f"{_UC}/tables/{stage_full_name}")
+        except Exception:
+            pass
+        raise
+
+    # If cleanup fails, abort before the target table is modified.
+    await client.delete(f"{_UC}/tables/{stage_full_name}")
 
 
 async def _ensure_catalog(client: MinilakeClient, catalog: str) -> None:

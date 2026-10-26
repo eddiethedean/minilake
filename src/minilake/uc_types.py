@@ -60,7 +60,7 @@ _SCALARS: Dict[str, Tuple[str, str, str, str]] = {
     "NULL": ("VARCHAR", "NULL", "void", "void"),
 }
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,7 @@ def validate_identifier(name: str, kind: str) -> str:
     name additionally becomes a filename (`catalogs/{name}.duckdb` in duckdb_pool). A
     name containing a quote or a path separator escapes both.
     """
-    if not name or not _IDENTIFIER_RE.match(name):
+    if not name or not _IDENTIFIER_RE.fullmatch(name):
         raise DatabricksError(
             error_code="INVALID_REQUEST",
             message=(

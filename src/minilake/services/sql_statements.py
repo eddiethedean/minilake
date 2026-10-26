@@ -1021,6 +1021,14 @@ async def _execute_sql_real_typed(
             return columns, column_types, formatted_rows
 
         except Exception as e:
+            # A failed statement inside an explicit transaction leaves DuckDB's shared
+            # connection in an aborted state. Roll it back before releasing the lock so
+            # the failed request cannot poison later statements or strand partial writes.
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                # No active transaction is the normal case for non-transactional errors.
+                pass
             logger.error(f"SQL execution failed: {e}")
             raise DatabricksError(
                 error_code="INVALID_REQUEST",
