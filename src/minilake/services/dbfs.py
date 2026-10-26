@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
@@ -120,6 +121,31 @@ def _b64_decode(data: str) -> bytes:
         raise DatabricksError(error_code="INVALID_REQUEST", message=f"Invalid base64 content: {e}", status_code=400)
 
 
+def _write_file_without_overwrite(file_path: Path, content: bytes) -> None:
+    """Publish a complete file atomically, failing if its destination exists."""
+    fd, temporary_path = tempfile.mkstemp(prefix=".minilake-upload-", dir=file_path.parent)
+    committed = False
+    try:
+        with os.fdopen(fd, "wb") as temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        # The temporary file is in the same directory, so linking it publishes
+        # the complete contents atomically and cannot replace an existing path.
+        os.link(temporary_path, file_path)
+        committed = True
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            if committed:
+                logger.warning("Could not remove temporary DBFS upload file %s", temporary_path, exc_info=True)
+            else:
+                raise
+
+
 def _file_info(normalized: str, real_path: Path) -> DbfsFileInfo:
     stat = real_path.stat()
     return DbfsFileInfo(
@@ -161,10 +187,22 @@ async def close_handle(req: CloseHandleRequest) -> dict:
     """Finalize an upload: write the accumulated buffer to disk for real."""
     if req.handle not in _state["handles"]:
         raise DatabricksError(error_code="NOT_FOUND", message=f"Handle {req.handle} not found", status_code=404)
-    entry = _state["handles"].pop(req.handle)
+    entry = _state["handles"][req.handle]
     file_path = _resolve(entry["path"])
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_bytes(bytes(entry["buffer"]))
+    content = bytes(entry["buffer"])
+    try:
+        if entry["overwrite"]:
+            file_path.write_bytes(content)
+        else:
+            _write_file_without_overwrite(file_path, content)
+    except FileExistsError:
+        raise DatabricksError(
+            error_code="RESOURCE_ALREADY_EXISTS",
+            message=f"Path '{entry['path']}' already exists",
+            status_code=400,
+        ) from None
+    _state["handles"].pop(req.handle)
     logger.info(f"DBFS wrote {len(entry['buffer'])} bytes to {entry['path']}")
     return {}
 
