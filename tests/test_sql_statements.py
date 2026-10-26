@@ -13,6 +13,9 @@ from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import DataSourceFormat, TableType
 from databricks.sdk.service.sql import ColumnInfo, Disposition, Format
 
+from minilake.services import sql_statements as sql_service
+from minilake.services import unity_catalog
+
 
 @pytest.mark.crud
 @pytest.mark.parametrize(
@@ -111,6 +114,158 @@ def test_backtick_identifier_after_unicode_typed_literal(workspace_client: Works
     assert response.status.state.value == "SUCCEEDED"
     assert response.result.data_array == [["path\\"]]
     assert response.manifest.schema.columns[0].name == "value"
+
+
+@pytest.mark.parametrize(
+    "statement, expected",
+    [
+        pytest.param(
+            "SELECT 'rewrite.default.external' AS value",
+            "SELECT 'rewrite.default.external' AS value",
+            id="single-quoted-string",
+        ),
+        pytest.param(
+            "SELECT $$rewrite.default.external$$ AS value",
+            "SELECT $$rewrite.default.external$$ AS value",
+            id="dollar-quoted-string",
+        ),
+        pytest.param(
+            r"SELECT E'it\'s rewrite.default.external' AS value",
+            r"SELECT E'it\'s rewrite.default.external' AS value",
+            id="escaped-string",
+        ),
+        pytest.param(
+            'SELECT 1 AS "rewrite.default.external"',
+            'SELECT 1 AS "rewrite.default.external"',
+            id="quoted-alias",
+        ),
+        pytest.param(
+            "SELECT 1 /* rewrite.default.external */ -- rewrite.default.external\n",
+            "SELECT 1 /* rewrite.default.external */ -- rewrite.default.external\n",
+            id="comments",
+        ),
+        pytest.param(
+            "SELECT * FROM rewrite.default.external",
+            "SELECT * FROM delta_scan('/data/external''s')",
+            id="from-relation-and-escaped-storage-path",
+        ),
+        pytest.param(
+            'SELECT * FROM "rewrite"."default"."external"',
+            "SELECT * FROM delta_scan('/data/external''s')",
+            id="quoted-from-relation",
+        ),
+        pytest.param(
+            "SELECT * FROM (SELECT 1 AS a) x JOIN (SELECT 2 AS b) y ON true, rewrite.default.external",
+            "SELECT * FROM (SELECT 1 AS a) x JOIN (SELECT 2 AS b) y ON true, delta_scan('/data/external''s')",
+            id="comma-relation-after-join-on",
+        ),
+        pytest.param(
+            "SELECT * FROM (SELECT 1 AS a) x JOIN (SELECT 1 AS a) y USING (a), rewrite.default.external",
+            "SELECT * FROM (SELECT 1 AS a) x JOIN (SELECT 1 AS a) y USING (a), delta_scan('/data/external''s')",
+            id="comma-relation-after-join-using",
+        ),
+        pytest.param(
+            "SELECT * FROM set.default.external",
+            "SELECT * FROM delta_scan('/data/set')",
+            id="unreserved-keyword-catalog",
+        ),
+        pytest.param(
+            "SELECT * FROM values.default.external",
+            "SELECT * FROM delta_scan('/data/values')",
+            id="values-keyword-catalog",
+        ),
+        pytest.param(
+            "WITH x AS (FROM rewrite.default.external) SELECT * FROM x",
+            "WITH x AS (FROM delta_scan('/data/external''s')) SELECT * FROM x",
+            id="cte-from-first",
+        ),
+        pytest.param(
+            "WITH values AS (SELECT 1) FROM rewrite.default.external",
+            "WITH values AS (SELECT 1) FROM delta_scan('/data/external''s')",
+            id="values-cte-from-first",
+        ),
+        pytest.param(
+            "CREATE TEMP TABLE values AS FROM rewrite.default.external",
+            "CREATE TEMP TABLE values AS FROM delta_scan('/data/external''s')",
+            id="values-table-from-first",
+        ),
+        pytest.param(
+            "DELETE FROM target USING rewrite.default.external AS source WHERE target.id = source.id",
+            "DELETE FROM target USING delta_scan('/data/external''s') AS source WHERE target.id = source.id",
+            id="delete-using-external-source",
+        ),
+        pytest.param(
+            "MERGE INTO target USING rewrite.default.external AS source ON target.id = source.id "
+            "WHEN MATCHED THEN DELETE",
+            "MERGE INTO target USING delta_scan('/data/external''s') AS source ON target.id = source.id "
+            "WHEN MATCHED THEN DELETE",
+            id="merge-using-external-source",
+        ),
+        pytest.param(
+            "SELECT (FROM rewrite.default.external SELECT max(id))",
+            "SELECT (FROM delta_scan('/data/external''s') SELECT max(id))",
+            id="scalar-subquery-from-first",
+        ),
+        pytest.param(
+            "SELECT substring('abcdef' FROM rewrite.default.external)",
+            "SELECT substring('abcdef' FROM rewrite.default.external)",
+            id="substring-from-expression",
+        ),
+        pytest.param(
+            "SELECT substring($$abcdef$$ FROM rewrite.default.external)",
+            "SELECT substring($$abcdef$$ FROM rewrite.default.external)",
+            id="substring-dollar-string-from-expression",
+        ),
+        pytest.param(
+            "PIVOT rewrite.default.external ON category USING sum(id)",
+            "PIVOT delta_scan('/data/external''s') ON category USING sum(id)",
+            id="standalone-pivot-source",
+        ),
+        pytest.param(
+            "SELECT * FROM (PIVOT rewrite.default.external ON category USING sum(id)) p",
+            "SELECT * FROM (PIVOT delta_scan('/data/external''s') ON category USING sum(id)) p",
+            id="nested-pivot-source",
+        ),
+        pytest.param(
+            "PIVOT_WIDER rewrite.default.external ON category USING sum(id)",
+            "PIVOT_WIDER delta_scan('/data/external''s') ON category USING sum(id)",
+            id="pivot-wider-source",
+        ),
+        pytest.param(
+            "UNPIVOT rewrite.default.external ON id INTO NAME field VALUE amount",
+            "UNPIVOT delta_scan('/data/external''s') ON id INTO NAME field VALUE amount",
+            id="unpivot-source",
+        ),
+        pytest.param(
+            "SELECT extract(year FROM rewrite.default.external)",
+            "SELECT extract(year FROM rewrite.default.external)",
+            id="extract-from-expression",
+        ),
+        pytest.param(
+            "SELECT 0 IS DISTINCT FROM rewrite.default.external",
+            "SELECT 0 IS DISTINCT FROM rewrite.default.external",
+            id="distinct-from-expression",
+        ),
+        pytest.param(
+            "SELECT s.from, rewrite.default.external FROM (SELECT {'from': 1} AS s)",
+            "SELECT s.from, rewrite.default.external FROM (SELECT {'from': 1} AS s)",
+            id="qualified-field-named-from",
+        ),
+    ],
+)
+def test_external_table_rewrite_preserves_sql_context(monkeypatch, statement, expected):
+    """Only external table relation names are rewritten, with safe path quoting."""
+    monkeypatch.setitem(
+        unity_catalog._state,
+        "external_tables",
+        {
+            "rewrite.default.external": {"storage_location": "/data/external's"},
+            "set.default.external": {"storage_location": "/data/set"},
+            "values.default.external": {"storage_location": "/data/values"},
+        },
+    )
+
+    assert sql_service._rewrite_sql_for_duckdb(statement) == expected
 
 
 @pytest.fixture

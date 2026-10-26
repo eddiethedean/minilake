@@ -8,6 +8,7 @@ The test process shares the same `/data` volume as the minilake server (see
 docker-compose.test.yml), so files written here are immediately visible to it.
 """
 
+import os
 from uuid import uuid4
 
 import pandas as pd
@@ -187,7 +188,7 @@ def test_external_delta_table_read_via_sql(delta_catalog_and_schema, workspace_c
     """Register an EXTERNAL Delta table, write real Delta data, query it via SQL."""
     cat, schema = delta_catalog_and_schema
     table_name = f"people_{uuid4().hex[:6]}"
-    storage_location = f"/data/delta/{cat.name}/{schema.name}/{table_name}"
+    storage_location = f"{os.environ.get('MINILAKE_DATA_DIR', '/data')}/delta/{cat.name}/{schema.name}/{table_name}"
 
     table = workspace_client.tables.create(
         name=table_name,
@@ -211,6 +212,77 @@ def test_external_delta_table_read_via_sql(delta_catalog_and_schema, workspace_c
 
     assert result.status.state.value == "SUCCEEDED"
     assert result.result.data_array == [[1, "Alice"], [2, "Bob"], [3, "Charlie"]]
+
+    # Exercise relation forms through the HTTP SQL API with actual Delta files.
+    for statement, expected in (
+        (f"SELECT '{table.full_name}', $${table.full_name}$$", [[table.full_name, table.full_name]]),
+        (f"WITH x AS (FROM {table.full_name}) SELECT count(*) FROM x", [[3]]),
+        (f"WITH values AS (SELECT 1) FROM {table.full_name} SELECT count(*)", [[3]]),
+        (f"WITH x AS (WITH y AS (SELECT 1) FROM {table.full_name}) SELECT count(*) FROM x", [[3]]),
+        (f"SELECT (FROM {table.full_name} SELECT max(id))", [[3]]),
+        (f"SELECT (WITH y AS (SELECT 1) FROM {table.full_name} SELECT max(id))", [[3]]),
+        (f"SELECT count(*) FROM (SELECT 1 AS n) AS values, {table.full_name}", [[3]]),
+        (f"SELECT count(*) FROM (SELECT 1 AS n) values, {table.full_name}", [[3]]),
+        (f"SELECT count(*) FROM (PIVOT {table.full_name} ON name USING sum(id)) p", [[1]]),
+        (f"SELECT count(*) FROM (PIVOT_WIDER {table.full_name} ON name USING sum(id)) p", [[1]]),
+        (f"SELECT count(*) FROM (UNPIVOT {table.full_name} ON id INTO NAME field VALUE amount) p", [[3]]),
+        (
+            f"SELECT count(*) FROM (SELECT 0 AS Alice, 0 AS Bob, 0 AS Charlie "
+            f"UNION ALL PIVOT {table.full_name} ON name USING sum(id)) p",
+            [[2]],
+        ),
+        (
+            f"SELECT count(*) FROM (SELECT 0 AS Alice, 0 AS Bob, 0 AS Charlie "
+            f"INTERSECT PIVOT {table.full_name} ON name USING sum(id)) p",
+            [[0]],
+        ),
+        (
+            f"SELECT count(*) FROM (SELECT 0 AS Alice, 0 AS Bob, 0 AS Charlie "
+            f"EXCEPT PIVOT {table.full_name} ON name USING sum(id)) p",
+            [[1]],
+        ),
+        (
+            f"SELECT count(*) FROM (SELECT 'Alice' AS name, 'id' AS field, 0 AS amount "
+            f"UNION ALL UNPIVOT {table.full_name} ON id INTO NAME field VALUE amount) p",
+            [[4]],
+        ),
+    ):
+        response = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id, statement=statement
+        )
+        assert response.status.state.value == "SUCCEEDED", (statement, response.status)
+        assert response.result.data_array == expected
+
+    def execute(statement):
+        response = workspace_client.statement_execution.execute_statement(
+            warehouse_id=warehouse.id, statement=statement
+        )
+        assert response.status.state.value == "SUCCEEDED", (statement, response.status)
+        return response
+
+    # VALUES is also a valid unquoted table name, and USING introduces a
+    # relation in DELETE and MERGE (while JOIN USING names columns).
+    execute(f"CREATE TEMP TABLE values AS FROM {table.full_name}")
+    try:
+        assert execute("SELECT count(*) FROM values").result.data_array == [[3]]
+    finally:
+        execute("DROP TABLE values")
+
+    target = f"target_{uuid4().hex[:8]}"
+    execute(f"CREATE TEMP TABLE {target} AS SELECT 1 AS id")
+    try:
+        execute(f"DELETE FROM {target} USING {table.full_name} AS source WHERE {target}.id = source.id")
+        assert execute(f"SELECT count(*) FROM {target}").result.data_array == [[0]]
+        version = execute("SELECT version()").result.data_array[0][0]
+        if tuple(map(int, version.lstrip("v").split(".")[:2])) >= (1, 4):
+            execute(f"INSERT INTO {target} VALUES (1)")
+            execute(
+                f"MERGE INTO {target} USING {table.full_name} AS source ON {target}.id = source.id "
+                "WHEN MATCHED THEN UPDATE SET id = source.id + 10"
+            )
+            assert execute(f"SELECT id FROM {target}").result.data_array == [[11]]
+    finally:
+        execute(f"DROP TABLE {target}")
 
     print(f"✓ Real Delta table written externally and read via minilake SQL: {table.full_name}")
 

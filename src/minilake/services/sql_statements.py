@@ -532,21 +532,280 @@ def _rewrite_sql_for_duckdb(sql: str) -> str:
     if not external_tables:
         return sql
 
-    def replace_qualified_name(match):
-        catalog = match.group(1)
-        schema = match.group(2)
-        table = match.group(3)
-        full_name = f"{catalog}.{schema}.{table}"
+    # Tokenize executable SQL while skipping literals and comments. Quoted
+    # identifiers stay as tokens so fully quoted table names still work, but
+    # can never be mistaken for keywords such as FROM or JOIN.
+    tokens = []
+    i = 0
+    while i < len(sql):
+        if _is_duckdb_space(sql[i]):
+            i += 1
+        elif sql.startswith("--", i):
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+        elif sql.startswith("/*", i):
+            depth = 1
+            i += 2
+            while i < len(sql) and depth:
+                if sql.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif sql.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+        elif sql[i] == "'":
+            start = i
+            backslash_escapes = i > 0 and sql[i - 1] in "eE" and (i == 1 or not _is_duckdb_identifier_char(sql[i - 2]))
+            i, closed = _scan_quoted_token(sql, i, "'", backslash_escapes)
+            if backslash_escapes and closed:
+                while True:
+                    continuation = _skip_string_continuation_whitespace(sql, i)
+                    if continuation is None or continuation >= len(sql) or sql[continuation] != "'":
+                        break
+                    i, closed = _scan_quoted_token(sql, continuation, "'", backslash_escapes=True)
+                    if not closed:
+                        break
+            tokens.append((start, i, "literal", sql[start:i]))
+        elif sql[i] == "$" and (dollar_quote := _dollar_quote_delimiter(sql, i)):
+            start = i
+            end = sql.find(dollar_quote, i + len(dollar_quote))
+            i = len(sql) if end == -1 else end + len(dollar_quote)
+            tokens.append((start, i, "literal", sql[start:i]))
+        elif sql[i] in '"`':
+            start = i
+            quote = sql[i]
+            i, closed = _scan_quoted_token(sql, i, quote)
+            raw = sql[start + 1 : i - 1] if closed else sql[start + 1 : i]
+            value = raw.replace(quote * 2, quote)
+            tokens.append((start, i, "quoted_identifier", value))
+        elif _is_duckdb_identifier_char(sql[i]):
+            start = i
+            while i < len(sql) and _is_duckdb_identifier_char(sql[i]):
+                i += 1
+            tokens.append((start, i, "word", sql[start:i]))
+        else:
+            tokens.append((i, i + 1, "symbol", sql[i]))
+            i += 1
 
-        external = external_tables.get(full_name)
-        if external:
-            storage_location = external["storage_location"]
-            return f"delta_scan('{storage_location}')"
+    def external_name_at(token_index):
+        """Return (name, end-token-index) for a contiguous three-part identifier."""
+        parts = []
+        cursor = token_index
+        for part_index in range(3):
+            if cursor >= len(tokens) or tokens[cursor][2] not in ("word", "quoted_identifier"):
+                return None
+            parts.append(tokens[cursor][3])
+            if part_index < 2:
+                dot_index = cursor + 1
+                next_part_index = cursor + 2
+                if (
+                    next_part_index >= len(tokens)
+                    or tokens[dot_index][2:] != ("symbol", ".")
+                    or tokens[cursor][1] != tokens[dot_index][0]
+                    or tokens[dot_index][1] != tokens[next_part_index][0]
+                ):
+                    return None
+                cursor = next_part_index
 
-        return match.group(0)
+        next_index = cursor + 1
+        if (
+            next_index < len(tokens)
+            and tokens[next_index][2:] == ("symbol", ".")
+            and tokens[cursor][1] == tokens[next_index][0]
+        ):
+            return None
+        return ".".join(parts), cursor
 
-    # Match patterns like "catalog"."schema"."table" or catalog.schema.table
-    sql = re.sub(r'"?(\w+)"?\."?(\w+)"?\."?(\w+)"?', replace_qualified_name, sql)
+    replacements = []
+    scopes = [
+        {
+            "in_from": False,
+            "expect_relation": False,
+            "query_started": False,
+            "allow_bare_from": True,
+            "write_kind": None,
+            "write_source_pending": False,
+        }
+    ]
+    relation_modifiers = {"LATERAL", "ONLY"}
+    clause_ends = {
+        "EXCEPT",
+        "FETCH",
+        "GROUP",
+        "HAVING",
+        "INTERSECT",
+        "LIMIT",
+        "OFFSET",
+        "ORDER",
+        "QUALIFY",
+        "RETURNING",
+        "UNION",
+        "VALUES",
+        "WHERE",
+        "WINDOW",
+    }
+
+    token_index = 0
+    while token_index < len(tokens):
+        start, _end, kind, value = tokens[token_index]
+        scope = scopes[-1]
+
+        if kind == "symbol" and value == "(":
+            # Parentheses can wrap either a relation or a nested query.
+            relation_group = scope["expect_relation"]
+            next_token = tokens[token_index + 1] if token_index + 1 < len(tokens) else None
+            from_first_query = bool(
+                next_token and next_token[2] == "word" and next_token[3].upper() in {"FROM", "WITH"}
+            )
+            scope["expect_relation"] = False
+            scopes.append(
+                {
+                    "in_from": relation_group,
+                    "expect_relation": relation_group,
+                    "query_started": False,
+                    "allow_bare_from": from_first_query,
+                    "write_kind": None,
+                    "write_source_pending": False,
+                }
+            )
+            token_index += 1
+            continue
+        if kind == "symbol" and value == ")":
+            if len(scopes) > 1:
+                scopes.pop()
+                scopes[-1]["expect_relation"] = False
+            token_index += 1
+            continue
+        if kind == "symbol" and value == ",":
+            if scope["in_from"]:
+                scope["expect_relation"] = True
+            token_index += 1
+            continue
+        if kind == "symbol" and value == ";":
+            scope.update(
+                in_from=False,
+                expect_relation=False,
+                query_started=False,
+                allow_bare_from=True,
+                write_kind=None,
+                write_source_pending=False,
+            )
+            token_index += 1
+            continue
+
+        # A qualified relation can start with a word that is also a clause
+        # keyword, such as the catalog name `values`.
+        if scope["expect_relation"] and kind in ("word", "quoted_identifier"):
+            external_name = external_name_at(token_index)
+            if external_name is not None:
+                full_name, last_token_index = external_name
+                external = external_tables.get(full_name)
+                if external:
+                    storage_location = external["storage_location"].replace("'", "''")
+                    replacements.append((start, tokens[last_token_index][1], f"delta_scan('{storage_location}')"))
+                token_index = last_token_index + 1
+                scope["expect_relation"] = False
+                continue
+
+        if kind == "word":
+            keyword = value.upper()
+            is_qualified_part = token_index > 0 and tokens[token_index - 1][2:] == ("symbol", ".")
+            previous_words = [
+                token[3].upper() if token[2] == "word" else None
+                for token in tokens[max(0, token_index - 3) : token_index]
+            ]
+            is_distinct_from = (
+                keyword == "FROM"
+                and len(previous_words) >= 2
+                and previous_words[-1] == "DISTINCT"
+                and previous_words[-2] in {"IS", "NOT"}
+                and (previous_words[-2] != "NOT" or (len(previous_words) >= 3 and previous_words[-3] == "IS"))
+            )
+
+            if (
+                not is_qualified_part
+                and keyword in {"DELETE", "MERGE"}
+                and scope["write_kind"] is None
+                and not scope["query_started"]
+                and not scope["in_from"]
+            ):
+                scope["write_kind"] = keyword
+                scope["write_source_pending"] = True
+
+            if not is_qualified_part and keyword == "SELECT":
+                scope["query_started"] = True
+                scope["allow_bare_from"] = False
+                scope["in_from"] = False
+                scope["expect_relation"] = False
+                token_index += 1
+                continue
+            if not is_qualified_part and keyword in {"FROM", "JOIN"}:
+                if keyword == "JOIN" or (not is_distinct_from and (scope["query_started"] or scope["allow_bare_from"])):
+                    scope["in_from"] = True
+                    scope["expect_relation"] = True
+                token_index += 1
+                continue
+            if (
+                not is_qualified_part
+                and keyword in {"PIVOT", "PIVOT_WIDER", "UNPIVOT"}
+                and not scope["query_started"]
+                and (not scope["in_from"] or scope["expect_relation"])
+            ):
+                # These query forms can use a table as their direct input.
+                scope["in_from"] = True
+                scope["expect_relation"] = True
+                scope["query_started"] = True
+                scope["allow_bare_from"] = False
+                token_index += 1
+                continue
+            if not is_qualified_part and keyword == "USING" and scope["write_source_pending"]:
+                # DELETE and MERGE use USING to introduce a source relation.
+                scope["in_from"] = True
+                scope["expect_relation"] = True
+                scope["write_source_pending"] = False
+                token_index += 1
+                continue
+            if not is_qualified_part and keyword in {"ON", "USING"}:
+                # These begin join/pivot conditions, but the surrounding FROM
+                # list remains active so a following comma can add a relation.
+                scope["expect_relation"] = False
+                token_index += 1
+                continue
+            if not is_qualified_part and keyword in {"UNION", "INTERSECT", "EXCEPT"}:
+                # The next operand begins a new query at the same nesting level.
+                scope.update(in_from=False, expect_relation=False, query_started=False, allow_bare_from=True)
+                token_index += 1
+                continue
+            if (
+                not is_qualified_part
+                and keyword == "VALUES"
+                and (
+                    (scope["in_from"] and not scope["expect_relation"])
+                    or (not scope["query_started"] and not scope["in_from"])
+                )
+            ):
+                # VALUES can be an identifier, or start a query operand.
+                token_index += 1
+                continue
+            if not is_qualified_part and not is_distinct_from and keyword in clause_ends:
+                scope["in_from"] = False
+                scope["expect_relation"] = False
+                scope["allow_bare_from"] = False
+                token_index += 1
+                continue
+            if scope["expect_relation"] and keyword in relation_modifiers:
+                token_index += 1
+                continue
+
+        if scope["expect_relation"] and kind in ("word", "quoted_identifier", "literal"):
+            scope["expect_relation"] = False
+
+        token_index += 1
+
+    for start, end, replacement in reversed(replacements):
+        sql = sql[:start] + replacement + sql[end:]
 
     logger.debug(f"Rewritten SQL: {sql}")
     return sql
